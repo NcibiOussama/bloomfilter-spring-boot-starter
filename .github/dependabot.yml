@@ -7,6 +7,11 @@ updates:
     groups:
       spring:
         patterns: ['org.springframework*']
+    ignore:
+      # Major Spring Boot upgrades (e.g. 3 -> 4) need a deliberate migration, not an automated bump.
+      # Patch/minor updates (security fixes) are still proposed.
+      - dependency-name: 'org.springframework.boot:*'
+        update-types: ['version-update:semver-major']
   - package-ecosystem: github-actions
     directory: /
     schedule:
