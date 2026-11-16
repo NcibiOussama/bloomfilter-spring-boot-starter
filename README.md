@@ -1,5 +1,9 @@
 # Bloom Filter Spring Boot Starter
 
+[![Maven Central](https://img.shields.io/maven-central/v/io.github.ncibioussama/bloomfilter-spring-boot-starter)](https://central.sonatype.com/artifact/io.github.ncibioussama/bloomfilter-spring-boot-starter)
+[![CI](https://github.com/NcibiOussama/bloomfilter-spring-boot-starter/actions/workflows/ci.yml/badge.svg)](https://github.com/NcibiOussama/bloomfilter-spring-boot-starter/actions/workflows/ci.yml)
+[![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
+
 Secure, observable, declarative Bloom filters for Spring Boot 3.
 
 - **One dependency, a few lines of YAML.** In-memory or Redis backend, switchable by configuration.
@@ -18,6 +22,12 @@ Secure, observable, declarative Bloom filters for Spring Boot 3.
   <artifactId>bloomfilter-spring-boot-starter</artifactId>
   <version>0.1.0</version>
 </dependency>
+```
+
+Gradle:
+
+```groovy
+implementation 'io.github.ncibioussama:bloomfilter-spring-boot-starter:0.1.0'
 ```
 
 Requires Java 17+ and Spring Boot 3.x.
