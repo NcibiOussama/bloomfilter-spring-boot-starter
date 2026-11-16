@@ -85,7 +85,7 @@ class BloomFilterAutoConfigurationTest {
                     ManagedBloomFilter users = context.getBean(BloomFilterRegistry.class).managed("users");
                     assertThat(users.backend()).isEqualTo("redis");
                     assertThat(users.delegate()).isInstanceOf(RedisBloomFilter.class);
-                    assertThat(((RedisBloomFilter) users.delegate()).redisKey()).startsWith("bloom:test:users:");
+                    assertThat(((RedisBloomFilter) users.delegate()).redisKey()).startsWith("bloom:test:{users:");
                 });
     }
 

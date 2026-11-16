@@ -3,6 +3,7 @@ package io.github.ncibioussama.bloomfilter.autoconfigure;
 import io.github.ncibioussama.bloomfilter.core.BloomFilterSpec;
 import io.github.ncibioussama.bloomfilter.core.DefaultKeyEncoder;
 import io.github.ncibioussama.bloomfilter.core.FailureMode;
+import java.time.Duration;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import org.springframework.boot.context.properties.ConfigurationProperties;
@@ -53,6 +54,73 @@ public class BloomFilterProperties {
     private final Redis redis = new Redis();
 
     private final WarmUp warmUp = new WarmUp();
+
+    private final Rebuild rebuild = new Rebuild();
+
+    public Rebuild getRebuild() {
+        return rebuild;
+    }
+
+    /**
+     * Rebuilds: replacing a filter's content with a fresh load from its BloomFilterLoader.
+     */
+    public static class Rebuild {
+
+        /**
+         * Whether to run scheduled rebuilds (per-filter 'rebuild-cron') and automatic recovery.
+         */
+        private boolean enabled = true;
+
+        /**
+         * How often to retry rebuilding degraded filters (lost writes, failed warm-up). Zero disables
+         * automatic recovery.
+         */
+        private Duration recoveryInterval = Duration.ofMinutes(1);
+
+        /**
+         * Maximum duration of one rebuild. For shared backends this is the lock lifetime; a rebuild that takes
+         * longer is cancelled instead of risking lost writes.
+         */
+        private Duration timeout = Duration.ofHours(1);
+
+        /**
+         * Whether POST /actuator/bloomfilters/{name} may trigger a rebuild. A rebuild reloads every key from
+         * the source of truth, so only enable this behind actuator security.
+         */
+        private boolean endpointEnabled = false;
+
+        public boolean isEnabled() {
+            return enabled;
+        }
+
+        public void setEnabled(boolean enabled) {
+            this.enabled = enabled;
+        }
+
+        public Duration getRecoveryInterval() {
+            return recoveryInterval;
+        }
+
+        public void setRecoveryInterval(Duration recoveryInterval) {
+            this.recoveryInterval = recoveryInterval;
+        }
+
+        public Duration getTimeout() {
+            return timeout;
+        }
+
+        public void setTimeout(Duration timeout) {
+            this.timeout = timeout;
+        }
+
+        public boolean isEndpointEnabled() {
+            return endpointEnabled;
+        }
+
+        public void setEndpointEnabled(boolean endpointEnabled) {
+            this.endpointEnabled = endpointEnabled;
+        }
+    }
 
     public boolean isEnabled() {
         return enabled;
@@ -155,6 +223,21 @@ public class BloomFilterProperties {
          * Behaviour when a remote backend is unavailable.
          */
         private FailureMode failureMode = FailureMode.FAIL_OPEN;
+
+        /**
+         * Cron expression (Spring format, 6 fields) for scheduled rebuilds from the filter's
+         * BloomFilterLoader, for example "0 0 3 * * *" for every night at 3:00. Rebuilding removes deleted
+         * keys. Requires a BloomFilterLoader for this filter.
+         */
+        private String rebuildCron;
+
+        public String getRebuildCron() {
+            return rebuildCron;
+        }
+
+        public void setRebuildCron(String rebuildCron) {
+            this.rebuildCron = rebuildCron;
+        }
 
         public long getExpectedInsertions() {
             return expectedInsertions;

@@ -124,6 +124,14 @@ public class BloomFilterAutoConfiguration {
     }
 
     @Bean
+    @ConditionalOnMissingBean
+    BloomFilterRebuilder bloomFilterRebuilder(BloomFilterRegistry registry,
+                                              ObjectProvider<BloomFilterLoader> loaders,
+                                              BloomFilterProperties properties) {
+        return new BloomFilterRebuilder(registry, loaders.orderedStream().toList(), properties);
+    }
+
+    @Bean
     @Role(BeanDefinition.ROLE_INFRASTRUCTURE)
     static Advisor bloomFilterAnnotationAdvisor(ObjectProvider<BloomFilterRegistry> registry) {
         DefaultPointcutAdvisor advisor = new DefaultPointcutAdvisor(

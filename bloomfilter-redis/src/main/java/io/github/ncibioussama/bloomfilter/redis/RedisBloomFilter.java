@@ -7,18 +7,21 @@ import io.github.ncibioussama.bloomfilter.core.BloomFilterUnavailableException;
 import io.github.ncibioussama.bloomfilter.core.FailureMode;
 import io.github.ncibioussama.bloomfilter.core.HashStrategy;
 import io.github.ncibioussama.bloomfilter.core.KeyEncoder;
+import io.github.ncibioussama.bloomfilter.core.RebuildSession;
+import io.github.ncibioussama.bloomfilter.core.Rebuildable;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.springframework.dao.DataAccessException;
-import org.springframework.data.redis.connection.RedisConnection;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
@@ -30,25 +33,52 @@ import org.springframework.data.redis.core.script.RedisScript;
  * All bits of a key are read or written by a single Lua script, so each operation is one atomic
  * round-trip instead of {@code k}.
  * <p>
- * The Redis key contains a fingerprint of the sizing and hash configuration
- * ({@code <prefix><name>:<fingerprint>}). Changing the size, the algorithm or the secret therefore
- * switches to a fresh, empty bitmap instead of silently reading incompatible bits (which would cause
- * false negatives). The warm-up loader then repopulates it.
+ * Redis keys, all in the same Redis Cluster hash slot thanks to the {@code {...}} hash tag:
+ * <ul>
+ *     <li>{@code <prefix>{<name>:<fingerprint>}}: the bitmap</li>
+ *     <li>{@code ...:ready}: set once a complete load or rebuild finished</li>
+ *     <li>{@code ...:next}: the bitmap being rebuilt</li>
+ *     <li>{@code ...:rebuild}: rebuild lock and dual-write signal, with an expiry</li>
+ * </ul>
+ * The fingerprint covers the sizing and hash configuration, so changing size, algorithm or secret
+ * switches to a fresh bitmap instead of reading incompatible bits (which would cause false negatives).
  */
-public final class RedisBloomFilter implements BloomFilter {
+public final class RedisBloomFilter implements BloomFilter, Rebuildable {
 
     private static final Log log = LogFactory.getLog(RedisBloomFilter.class);
     private static final long WARN_INTERVAL_MILLIS = 30_000;
 
+    /** KEYS: main, rebuild marker, next. ARGV: bit indexes. Dual-writes into next while a rebuild runs. */
     private static final RedisScript<Long> PUT_SCRIPT = new DefaultRedisScript<>("""
+            local dual = redis.call('EXISTS', KEYS[2]) == 1
             local added = 0
             for i = 1, #ARGV do
               if redis.call('SETBIT', KEYS[1], ARGV[i], 1) == 0 then added = added + 1 end
+              if dual then redis.call('SETBIT', KEYS[3], ARGV[i], 1) end
             end
             return added
             """, Long.class);
 
+    /** KEYS: main, rebuild marker, next. ARGV[1]: k, then k indexes per key. Returns number of new keys. */
     private static final RedisScript<Long> PUT_ALL_SCRIPT = new DefaultRedisScript<>("""
+            local dual = redis.call('EXISTS', KEYS[2]) == 1
+            local k = tonumber(ARGV[1])
+            local newKeys = 0
+            local i = 2
+            while i <= #ARGV do
+              local changed = false
+              for j = 0, k - 1 do
+                if redis.call('SETBIT', KEYS[1], ARGV[i + j], 1) == 0 then changed = true end
+                if dual then redis.call('SETBIT', KEYS[3], ARGV[i + j], 1) end
+              end
+              if changed then newKeys = newKeys + 1 end
+              i = i + k
+            end
+            return newKeys
+            """, Long.class);
+
+    /** KEYS: bitmap. ARGV[1]: k, then k indexes per key. Plain bulk write, used for the rebuild target. */
+    private static final RedisScript<Long> TARGET_PUT_ALL_SCRIPT = new DefaultRedisScript<>("""
             local k = tonumber(ARGV[1])
             local newKeys = 0
             local i = 2
@@ -63,11 +93,43 @@ public final class RedisBloomFilter implements BloomFilter {
             return newKeys
             """, Long.class);
 
+    /** KEYS: bitmap. ARGV: bit indexes. */
     private static final RedisScript<Long> CONTAINS_SCRIPT = new DefaultRedisScript<>("""
             for i = 1, #ARGV do
               if redis.call('GETBIT', KEYS[1], ARGV[i]) == 0 then return 0 end
             end
             return 1
+            """, Long.class);
+
+    /** KEYS: rebuild marker, next. ARGV: token, ttl millis. Acquires the lock and clears a stale target. */
+    private static final RedisScript<Long> BEGIN_REBUILD_SCRIPT = new DefaultRedisScript<>("""
+            if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'PX', ARGV[2]) then
+              redis.call('DEL', KEYS[2])
+              return 1
+            end
+            return 0
+            """, Long.class);
+
+    /** KEYS: main, next, rebuild marker, ready. ARGV: token. Swaps only while the lock is still ours. */
+    private static final RedisScript<Long> COMMIT_REBUILD_SCRIPT = new DefaultRedisScript<>("""
+            if redis.call('GET', KEYS[3]) ~= ARGV[1] then return 0 end
+            if redis.call('EXISTS', KEYS[2]) == 1 then
+              redis.call('RENAME', KEYS[2], KEYS[1])
+            else
+              redis.call('DEL', KEYS[1])
+            end
+            redis.call('SET', KEYS[4], '1')
+            redis.call('DEL', KEYS[3])
+            return 1
+            """, Long.class);
+
+    /** KEYS: rebuild marker, next. ARGV: token. */
+    private static final RedisScript<Long> ABORT_REBUILD_SCRIPT = new DefaultRedisScript<>("""
+            if redis.call('GET', KEYS[1]) == ARGV[1] then
+              redis.call('DEL', KEYS[1], KEYS[2])
+              return 1
+            end
+            return 0
             """, Long.class);
 
     /** Redis bitmaps are limited to 2^32 bits (512 MiB). */
@@ -80,7 +142,9 @@ public final class RedisBloomFilter implements BloomFilter {
     private final FailureMode failureMode;
     private final int batchSize;
     private final String redisKey;
-    private final byte[] redisKeyBytes;
+    private final String readyKey;
+    private final String nextKey;
+    private final String rebuildKey;
     private final LongAdder errors = new LongAdder();
     private final AtomicLong lastWarn = new AtomicLong();
 
@@ -89,7 +153,7 @@ public final class RedisBloomFilter implements BloomFilter {
      * @param hashStrategy hash strategy; must be identical on every instance sharing the filter
      * @param keyEncoder   key encoder; must be identical on every instance sharing the filter
      * @param redis        template connected to Redis
-     * @param keyPrefix    prefix for the Redis key, for example {@code "bloom:myapp:"}
+     * @param keyPrefix    prefix for the Redis keys, for example {@code "bloom:myapp:"}
      * @param failureMode  behaviour when Redis is unavailable
      * @param batchSize    number of keys per Lua call in {@link #putAll(Iterable)}
      */
@@ -111,8 +175,11 @@ public final class RedisBloomFilter implements BloomFilter {
         this.redis = redis;
         this.failureMode = failureMode;
         this.batchSize = batchSize;
-        this.redisKey = (keyPrefix == null ? "" : keyPrefix) + spec.name() + ":" + fingerprint(spec, hashStrategy);
-        this.redisKeyBytes = redisKey.getBytes(StandardCharsets.UTF_8);
+        this.redisKey = (keyPrefix == null ? "" : keyPrefix)
+                + "{" + spec.name() + ":" + fingerprint(spec, hashStrategy) + "}";
+        this.readyKey = redisKey + ":ready";
+        this.nextKey = redisKey + ":next";
+        this.rebuildKey = redisKey + ":rebuild";
     }
 
     /**
@@ -138,7 +205,7 @@ public final class RedisBloomFilter implements BloomFilter {
     public boolean put(Object key) {
         List<String> args = indexArgs(key, new ArrayList<>(spec.hashFunctions()));
         try {
-            Long added = redis.execute(PUT_SCRIPT, List.of(redisKey), args.toArray());
+            Long added = redis.execute(PUT_SCRIPT, List.of(redisKey, rebuildKey, nextKey), args.toArray());
             return added != null && added > 0;
         } catch (DataAccessException e) {
             onError("put", e);
@@ -148,6 +215,15 @@ public final class RedisBloomFilter implements BloomFilter {
 
     @Override
     public long putAll(Iterable<?> keys) {
+        try {
+            return batchPut(keys, PUT_ALL_SCRIPT, List.of(redisKey, rebuildKey, nextKey));
+        } catch (DataAccessException e) {
+            onError("putAll", e);
+            return 0;
+        }
+    }
+
+    private long batchPut(Iterable<?> keys, RedisScript<Long> script, List<String> redisKeys) {
         long newKeys = 0;
         List<String> args = new ArrayList<>(1 + batchSize * spec.hashFunctions());
         args.add(Integer.toString(spec.hashFunctions()));
@@ -155,25 +231,20 @@ public final class RedisBloomFilter implements BloomFilter {
         for (Object key : keys) {
             indexArgs(key, args);
             if (++inBatch == batchSize) {
-                newKeys += flush(args);
+                newKeys += executeLong(script, redisKeys, args);
                 args.subList(1, args.size()).clear();
                 inBatch = 0;
             }
         }
         if (inBatch > 0) {
-            newKeys += flush(args);
+            newKeys += executeLong(script, redisKeys, args);
         }
         return newKeys;
     }
 
-    private long flush(List<String> args) {
-        try {
-            Long added = redis.execute(PUT_ALL_SCRIPT, List.of(redisKey), args.toArray());
-            return added == null ? 0 : added;
-        } catch (DataAccessException e) {
-            onError("putAll", e);
-            return 0;
-        }
+    private long executeLong(RedisScript<Long> script, List<String> redisKeys, List<String> args) {
+        Long result = redis.execute(script, redisKeys, args.toArray());
+        return result == null ? 0 : result;
     }
 
     @Override
@@ -183,13 +254,17 @@ public final class RedisBloomFilter implements BloomFilter {
 
     @Override
     public BloomFilterStats stats() {
+        return statsOf(redisKey);
+    }
+
+    private BloomFilterStats statsOf(String key) {
+        byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
         try {
-            Long bits = redis.execute((RedisCallback<Long>) (RedisConnection connection) ->
-                    connection.stringCommands().bitCount(redisKeyBytes));
+            Long bits = redis.execute((RedisCallback<Long>) connection ->
+                    connection.stringCommands().bitCount(keyBytes));
             return new BloomFilterStats(spec, bits == null ? 0 : Math.min(bits, spec.bitSize()));
         } catch (DataAccessException e) {
-            errors.increment();
-            throw new BloomFilterUnavailableException("Redis unavailable for Bloom filter '" + spec.name() + "'", e);
+            throw unavailable("stats", e);
         }
     }
 
@@ -198,18 +273,38 @@ public final class RedisBloomFilter implements BloomFilter {
         try {
             return !Boolean.TRUE.equals(redis.hasKey(redisKey));
         } catch (DataAccessException e) {
-            errors.increment();
-            throw new BloomFilterUnavailableException("Redis unavailable for Bloom filter '" + spec.name() + "'", e);
+            throw unavailable("isEmpty", e);
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     * Uses a separate marker, because another instance may still be loading a non-empty bitmap.
+     */
+    @Override
+    public boolean isPopulated() {
+        try {
+            return Boolean.TRUE.equals(redis.hasKey(readyKey));
+        } catch (DataAccessException e) {
+            throw unavailable("isPopulated", e);
+        }
+    }
+
+    @Override
+    public void markPopulated() {
+        try {
+            redis.opsForValue().set(readyKey, "1");
+        } catch (DataAccessException e) {
+            throw unavailable("markPopulated", e);
         }
     }
 
     @Override
     public void clear() {
         try {
-            redis.delete(redisKey);
+            redis.delete(List.of(redisKey, readyKey));
         } catch (DataAccessException e) {
-            errors.increment();
-            throw new BloomFilterUnavailableException("Redis unavailable for Bloom filter '" + spec.name() + "'", e);
+            throw unavailable("clear", e);
         }
     }
 
@@ -218,11 +313,32 @@ public final class RedisBloomFilter implements BloomFilter {
         return errors.sum();
     }
 
+    @Override
+    public RebuildSession beginRebuild(Duration maxDuration) {
+        if (maxDuration == null || maxDuration.toMillis() < 1) {
+            throw new IllegalArgumentException("maxDuration must be positive");
+        }
+        String token = UUID.randomUUID().toString();
+        try {
+            Long acquired = redis.execute(BEGIN_REBUILD_SCRIPT, List.of(rebuildKey, nextKey),
+                    token, Long.toString(maxDuration.toMillis()));
+            return acquired != null && acquired == 1 ? new Session(token) : null;
+        } catch (DataAccessException e) {
+            throw unavailable("beginRebuild", e);
+        }
+    }
+
     private List<String> indexArgs(Object key, List<String> target) {
         for (long index : hashStrategy.indexes(keyEncoder.encode(key), spec.hashFunctions(), spec.bitSize())) {
             target.add(Long.toString(index));
         }
         return target;
+    }
+
+    private BloomFilterUnavailableException unavailable(String operation, DataAccessException e) {
+        errors.increment();
+        return new BloomFilterUnavailableException(
+                "Redis unavailable for Bloom filter '" + spec.name() + "' during " + operation, e);
     }
 
     private void onError(String operation, DataAccessException e) {
@@ -252,5 +368,85 @@ public final class RedisBloomFilter implements BloomFilter {
     @Override
     public String toString() {
         return "RedisBloomFilter[" + spec.name() + " -> " + redisKey + "]";
+    }
+
+    private final class Session implements RebuildSession {
+
+        private final String token;
+        private final BloomFilter target = new Target();
+
+        Session(String token) {
+            this.token = token;
+        }
+
+        @Override
+        public BloomFilter target() {
+            return target;
+        }
+
+        @Override
+        public boolean commit() {
+            try {
+                Long swapped = redis.execute(COMMIT_REBUILD_SCRIPT,
+                        List.of(redisKey, nextKey, rebuildKey, readyKey), token);
+                return swapped != null && swapped == 1;
+            } catch (DataAccessException e) {
+                throw unavailable("commitRebuild", e);
+            }
+        }
+
+        @Override
+        public void abort() {
+            try {
+                redis.execute(ABORT_REBUILD_SCRIPT, List.of(rebuildKey, nextKey), token);
+            } catch (DataAccessException e) {
+                // the lock expires on its own
+                errors.increment();
+            }
+        }
+    }
+
+    /** Write view of the bitmap being rebuilt. Never fails open: an incomplete target must abort. */
+    private final class Target implements BloomFilter {
+
+        @Override
+        public boolean mightContain(Object key) {
+            List<String> args = indexArgs(key, new ArrayList<>(spec.hashFunctions()));
+            try {
+                Long result = redis.execute(CONTAINS_SCRIPT, List.of(nextKey), args.toArray());
+                return result == null || result != 0;
+            } catch (DataAccessException e) {
+                throw unavailable("rebuild mightContain", e);
+            }
+        }
+
+        @Override
+        public boolean put(Object key) {
+            return putAll(List.of(key)) > 0;
+        }
+
+        @Override
+        public long putAll(Iterable<?> keys) {
+            try {
+                return batchPut(keys, TARGET_PUT_ALL_SCRIPT, List.of(nextKey));
+            } catch (DataAccessException e) {
+                throw unavailable("rebuild putAll", e);
+            }
+        }
+
+        @Override
+        public BloomFilterSpec spec() {
+            return spec;
+        }
+
+        @Override
+        public BloomFilterStats stats() {
+            return statsOf(nextKey);
+        }
+
+        @Override
+        public void clear() {
+            throw new UnsupportedOperationException("A rebuild target cannot be cleared; abort the rebuild instead");
+        }
     }
 }

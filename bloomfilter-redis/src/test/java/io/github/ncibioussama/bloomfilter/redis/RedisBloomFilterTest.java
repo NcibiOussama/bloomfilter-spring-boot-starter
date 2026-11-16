@@ -7,7 +7,9 @@ import io.github.ncibioussama.bloomfilter.core.BloomFilterSpec;
 import io.github.ncibioussama.bloomfilter.core.BloomFilterUnavailableException;
 import io.github.ncibioussama.bloomfilter.core.DefaultKeyEncoder;
 import io.github.ncibioussama.bloomfilter.core.FailureMode;
+import io.github.ncibioussama.bloomfilter.core.RebuildSession;
 import io.github.ncibioussama.bloomfilter.core.SipHashStrategy;
+import java.time.Duration;
 import java.util.List;
 import java.util.stream.LongStream;
 import org.junit.jupiter.api.AfterAll;
@@ -96,7 +98,69 @@ class RedisBloomFilterTest {
         RedisBloomFilter b = new RedisBloomFilter(BloomFilterSpec.of("users", 10_000, 0.01),
                 SipHashStrategy.withSecret("another-secret-0123456789"), new DefaultKeyEncoder(),
                 template, "bloom:test:", FailureMode.THROW, 100);
-        assertThat(a.redisKey()).isNotEqualTo(b.redisKey()).startsWith("bloom:test:users:");
+        assertThat(a.redisKey()).isNotEqualTo(b.redisKey()).startsWith("bloom:test:{users:").endsWith("}");
+    }
+
+    @Test
+    void populatedMarkerIsSeparateFromContent() {
+        RedisBloomFilter filter = filter("users", FailureMode.THROW);
+        filter.put("alice"); // another instance is still loading
+        assertThat(filter.isEmpty()).isFalse();
+        assertThat(filter.isPopulated()).isFalse();
+        filter.markPopulated();
+        assertThat(filter("users", FailureMode.THROW).isPopulated()).isTrue();
+    }
+
+    @Test
+    void rebuildDropsDeletedKeysAndKeepsWritesFromOtherInstances() {
+        RedisBloomFilter instanceA = filter("users", FailureMode.THROW);
+        RedisBloomFilter instanceB = filter("users", FailureMode.THROW);
+        instanceA.put("deleted-user");
+        instanceA.put("alice");
+
+        RebuildSession session = instanceA.beginRebuild(Duration.ofMinutes(1));
+        assertThat(instanceB.beginRebuild(Duration.ofMinutes(1))).as("lock held by instance A").isNull();
+        instanceB.put("created-on-b-during-rebuild");                    // dual-written by the Lua script
+        instanceB.putAll(List.of("bulk-1", "bulk-2"));                     // also dual-written
+        session.target().putAll(List.of("alice"));                        // loader reads the source of truth
+        assertThat(instanceB.mightContain("deleted-user")).as("old content serves until commit").isTrue();
+
+        assertThat(session.commit()).isTrue();
+
+        for (RedisBloomFilter instance : List.of(instanceA, instanceB)) {
+            assertThat(instance.mightContain("alice")).isTrue();
+            assertThat(instance.mightContain("created-on-b-during-rebuild")).isTrue();
+            assertThat(instance.mightContain("bulk-2")).isTrue();
+            assertThat(instance.mightContain("deleted-user")).isFalse();
+            assertThat(instance.isPopulated()).isTrue();
+        }
+        assertThat(template.keys("bloom:test:{users:*")).containsExactlyInAnyOrder(
+                instanceA.redisKey(), instanceA.redisKey() + ":ready");
+    }
+
+    @Test
+    void expiredLockCancelsTheSwapInsteadOfLosingWrites() throws InterruptedException {
+        RedisBloomFilter filter = filter("users", FailureMode.THROW);
+        filter.put("alice");
+        RebuildSession session = filter.beginRebuild(Duration.ofMillis(200));
+        Thread.sleep(400); // lock expired: other instances stopped dual-writing
+        filter.put("written-after-expiry");
+        assertThat(session.commit()).isFalse();
+        assertThat(filter.mightContain("alice")).isTrue();
+        assertThat(filter.mightContain("written-after-expiry")).isTrue();
+        assertThat(filter.beginRebuild(Duration.ofMinutes(1))).as("a new rebuild can start").isNotNull();
+    }
+
+    @Test
+    void abortReleasesTheLockAndKeepsContent() {
+        RedisBloomFilter filter = filter("users", FailureMode.THROW);
+        filter.put("alice");
+        RebuildSession session = filter.beginRebuild(Duration.ofMinutes(1));
+        session.target().put("other");
+        session.abort();
+        assertThat(filter.mightContain("alice")).isTrue();
+        assertThat(template.hasKey(filter.redisKey() + ":next")).isFalse();
+        assertThat(filter.beginRebuild(Duration.ofMinutes(1))).isNotNull();
     }
 
     @Test

@@ -3,7 +3,9 @@ package io.github.ncibioussama.bloomfilter.autoconfigure;
 import io.github.ncibioussama.bloomfilter.core.BloomFilter;
 import io.github.ncibioussama.bloomfilter.core.BloomFilterSpec;
 import io.github.ncibioussama.bloomfilter.core.BloomFilterStats;
+import java.time.Instant;
 import java.util.Iterator;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.LongAdder;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -27,7 +29,10 @@ public final class ManagedBloomFilter implements BloomFilter {
         WARMING_UP,
         /** Normal operation. */
         READY,
-        /** A write was lost (backend failure), so the filter may miss keys: checks are bypassed. */
+        /**
+         * The filter may miss keys (a write was lost, or loading failed): checks are bypassed until a
+         * successful rebuild.
+         */
         DEGRADED
     }
 
@@ -40,6 +45,10 @@ public final class ManagedBloomFilter implements BloomFilter {
     private final LongAdder bypassed = new LongAdder();
     private final LongAdder puts = new LongAdder();
     private final LongAdder falsePositives = new LongAdder();
+    private final LongAdder rebuildSuccesses = new LongAdder();
+    private final LongAdder rebuildFailures = new LongAdder();
+    private final AtomicBoolean rebuilding = new AtomicBoolean();
+    private volatile Instant lastRebuild;
 
     ManagedBloomFilter(BloomFilter delegate, String backend, State initialState) {
         this.delegate = delegate;
@@ -142,13 +151,69 @@ public final class ManagedBloomFilter implements BloomFilter {
         }
     }
 
+    /** After a successful full rebuild: the content is complete again, whatever the previous state. */
+    void markRecovered() {
+        state = State.READY;
+    }
+
     void markDegraded() {
+        markDegraded("it lost a write because its backend failed");
+    }
+
+    void markDegraded(String reason) {
         if (state != State.DEGRADED) {
             state = State.DEGRADED;
-            log.error("Bloom filter '" + name() + "' lost a write because its backend failed. Checks are now "
-                    + "bypassed (always 'might contain') to avoid wrong 'not found' answers. Restart or rebuild "
-                    + "the filter to re-enable it.");
+            log.error("Bloom filter '" + name() + "' is degraded: " + reason + ". Checks are bypassed "
+                    + "(always 'might contain') to avoid wrong 'not found' answers until the filter is rebuilt.");
         }
+    }
+
+    boolean tryStartRebuild() {
+        return rebuilding.compareAndSet(false, true);
+    }
+
+    void finishRebuild(boolean success) {
+        if (success) {
+            rebuildSuccesses.increment();
+            lastRebuild = Instant.now();
+        } else {
+            rebuildFailures.increment();
+        }
+        rebuilding.set(false);
+    }
+
+    void cancelRebuild() {
+        rebuilding.set(false);
+    }
+
+    /** @return whether a rebuild is running on this instance */
+    public boolean isRebuilding() {
+        return rebuilding.get();
+    }
+
+    /** @return successful rebuilds since startup */
+    public long rebuildSuccessCount() {
+        return rebuildSuccesses.sum();
+    }
+
+    /** @return failed rebuilds since startup */
+    public long rebuildFailureCount() {
+        return rebuildFailures.sum();
+    }
+
+    /** @return time of the last successful rebuild on this instance, or {@code null} */
+    public Instant lastRebuild() {
+        return lastRebuild;
+    }
+
+    @Override
+    public boolean isPopulated() {
+        return delegate.isPopulated();
+    }
+
+    @Override
+    public void markPopulated() {
+        delegate.markPopulated();
     }
 
     private void detectLostWrite(long errorsBefore) {
