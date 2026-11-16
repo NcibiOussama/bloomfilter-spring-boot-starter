@@ -72,6 +72,23 @@ public interface BloomFilter {
     }
 
     /**
+     * Whether the filter was completely loaded with all existing keys (see {@link #markPopulated()}).
+     * A shared filter can be non-empty while another instance is still loading it, so this, not
+     * {@link #isEmpty()}, decides whether loading can be skipped.
+     *
+     * @return {@code true} if a complete load or rebuild has finished
+     */
+    default boolean isPopulated() {
+        return !isEmpty();
+    }
+
+    /**
+     * Records that every existing key has been added. Persistent backends store this marker.
+     */
+    default void markPopulated() {
+    }
+
+    /**
      * Removes all keys.
      */
     void clear();

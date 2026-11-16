@@ -20,14 +20,14 @@ Secure, observable, declarative Bloom filters for Spring Boot 3.5 and 4.
 <dependency>
   <groupId>io.github.ncibioussama</groupId>
   <artifactId>bloomfilter-spring-boot-starter</artifactId>
-  <version>0.2.0</version>
+  <version>0.3.0</version>
 </dependency>
 ```
 
 Gradle:
 
 ```groovy
-implementation 'io.github.ncibioussama:bloomfilter-spring-boot-starter:0.2.0'
+implementation 'io.github.ncibioussama:bloomfilter-spring-boot-starter:0.3.0'
 ```
 
 Requires Java 17+. Works with **Spring Boot 3.5 and 4.x** from the same artifact (both tested in CI).
@@ -113,16 +113,43 @@ bloom:
       failure-mode: fail-open   # or 'throw'
 ```
 
-Each check or insert is a single atomic Lua call. With the default `warm-up.mode=if-empty`, only the first
-instance loads a shared filter.
+Each check or insert is a single atomic Lua call. With the default `warm-up.mode=if-empty`, a shared filter
+is loaded once: later instances skip loading only after a load has *completed*, never while another instance
+is still loading.
+
+## Keep filters fresh: rebuilds
+
+A Bloom filter can't remove keys, so deleted rows stay "maybe present" and the filter slowly fills up.
+A **rebuild** reloads every key from your `BloomFilterLoader` into a fresh filter and swaps it in atomically:
+
+```yaml
+bloom:
+  filters:
+    users:
+      rebuild-cron: "0 0 3 * * *"   # every night at 3:00 (Spring cron, 6 fields)
+```
+
+- **No wrong answers during a rebuild.** The current filter keeps serving checks. Keys added while the rebuild
+  runs are written to both filters, so nothing is lost at the swap.
+- **Redis:** the new bitmap is built under a `:next` key and swapped in with one atomic `RENAME`, so every
+  instance switches at the same moment. A Redis lock ensures only one instance rebuilds a filter. If a rebuild
+  takes longer than `bloom.rebuild.timeout`, it's cancelled instead of risking lost writes.
+- **Self-healing:** a `DEGRADED` filter (a lost write, or Redis down during startup) is rebuilt automatically
+  every `bloom.rebuild.recovery-interval` until it succeeds, then answers checks again.
+- **On demand:** `rebuilder.rebuild("users")` (inject `BloomFilterRebuilder`), or
+  `POST /actuator/bloomfilters/users` with `bloom.rebuild.endpoint-enabled=true` (secure your actuator first).
+
+An in-memory rebuild temporarily needs twice the filter's memory.
 
 ## Security
 
 | Threat | Protection |
 |---|---|
 | Hash flooding (attacker crafts keys that fill the filter) | Keyed SipHash-2-4. Random key for in-memory filters, `bloom.security.secret` for Redis |
-| Wrong "not found" when Redis is down or a write was lost | Fail-open, then the filter switches to bypass mode (`DEGRADED`) |
-| Wrong "not found" during startup | Checks are bypassed until the loader finishes |
+| Wrong "not found" when Redis is down or a write was lost | Fail-open, then bypass mode (`DEGRADED`) until an automatic rebuild succeeds |
+| Wrong "not found" during startup | Checks are bypassed until the loader finishes; shared filters are only skipped once fully loaded |
+| Wrong "not found" during a rebuild | Old content serves until an atomic swap; concurrent writes go to both filters |
+| Rebuild endpoint abused to load the database | `POST` rebuild is disabled unless `bloom.rebuild.endpoint-enabled=true`; one rebuild per filter at a time |
 | Misconfiguration exhausting memory | `bloom.max-bits-per-filter` (default 512 MiB) and `bloom.max-key-bytes` (default 4096) |
 | Keys leaking (emails, tokens) | Keys never appear in logs, exceptions, metrics or the endpoint |
 | Changing size or secret on a shared filter | The Redis key embeds a configuration fingerprint, so a new empty filter is used and reloaded |
@@ -135,10 +162,11 @@ See [SECURITY.md](SECURITY.md) to report a vulnerability.
 |---|---|
 | `bloom.filter.checks` | `filter`, `backend`, `result` = `might_contain` / `absent` / `bypassed` |
 | `bloom.filter.puts`, `bloom.filter.false.positives`, `bloom.filter.backend.errors` | `filter`, `backend` |
+| `bloom.filter.rebuilds` | `filter`, `backend`, `result` = `success` / `failure` |
 | `bloom.filter.fill.ratio`, `bloom.filter.estimated.false.positive.rate`, `bloom.filter.approximate.elements`, `bloom.filter.ready` | `filter`, `backend` |
 
 `management.endpoints.web.exposure.include=bloomfilters` exposes `/actuator/bloomfilters` and
-`/actuator/bloomfilters/{name}` (sizing, fill and counters, never keys).
+`/actuator/bloomfilters/{name}` (sizing, fill, counters and rebuild status, never keys).
 
 ## All properties
 
@@ -150,6 +178,11 @@ See [SECURITY.md](SECURITY.md) to report a vulnerability.
 | `bloom.filters.<name>.false-positive-rate` | `0.01` | Target false-positive rate |
 | `bloom.filters.<name>.backend` | default backend | Per-filter backend |
 | `bloom.filters.<name>.failure-mode` | `fail-open` | `fail-open` or `throw` |
+| `bloom.filters.<name>.rebuild-cron` | none | Scheduled rebuild, e.g. `0 0 3 * * *` (needs a loader) |
+| `bloom.rebuild.enabled` | `true` | Run scheduled rebuilds and automatic recovery |
+| `bloom.rebuild.recovery-interval` | `1m` | Retry interval for `DEGRADED` filters (`0` disables) |
+| `bloom.rebuild.timeout` | `1h` | Maximum rebuild duration (Redis lock lifetime) |
+| `bloom.rebuild.endpoint-enabled` | `false` | Allow `POST /actuator/bloomfilters/{name}` to rebuild |
 | `bloom.security.hash-algorithm` | `auto` | `auto`, `siphash` or `murmur3` |
 | `bloom.security.secret` | none | SipHash key, ≥16 bytes |
 | `bloom.redis.key-prefix` | `bloom:` | Redis key prefix |
@@ -159,10 +192,11 @@ See [SECURITY.md](SECURITY.md) to report a vulnerability.
 | `bloom.max-key-bytes` | `4096` | Reject larger keys |
 | `bloom.max-bits-per-filter` | `4294967296` | Reject larger filters |
 
-## Limitations (v0.1)
+## Limitations
 
-- Keys cannot be removed (standard Bloom filter). Rebuild with atomic swap is planned for v0.2.
-- A `DEGRADED` filter stays in bypass mode until restart.
+- Single keys can't be removed (standard Bloom filter); use a scheduled rebuild to drop deleted keys.
+- Rebuilding requires a `BloomFilterLoader` for the filter. Without one, a `DEGRADED` filter stays in bypass
+  mode until restart.
 - Annotations work on calls through the Spring proxy, not on self-invocation (same as `@Transactional`).
 
 ## Build

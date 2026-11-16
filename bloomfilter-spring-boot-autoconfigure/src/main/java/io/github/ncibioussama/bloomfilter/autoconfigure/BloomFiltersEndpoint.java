@@ -7,21 +7,41 @@ import java.util.Map;
 import org.springframework.boot.actuate.endpoint.annotation.Endpoint;
 import org.springframework.boot.actuate.endpoint.annotation.ReadOperation;
 import org.springframework.boot.actuate.endpoint.annotation.Selector;
+import org.springframework.boot.actuate.endpoint.annotation.WriteOperation;
 
 /**
- * Read-only actuator endpoint {@code /actuator/bloomfilters}. Exposes sizing and statistics only,
- * never keys. Enable with {@code management.endpoints.web.exposure.include=bloomfilters}.
+ * Actuator endpoint {@code /actuator/bloomfilters}. Exposes sizing, statistics and rebuild status, never keys.
+ * Enable with {@code management.endpoints.web.exposure.include=bloomfilters}.
+ * <p>
+ * {@code POST /actuator/bloomfilters/{name}} starts a rebuild, but only when
+ * {@code bloom.rebuild.endpoint-enabled=true}.
  */
 @Endpoint(id = "bloomfilters")
 public class BloomFiltersEndpoint {
 
     private final BloomFilterRegistry registry;
+    private final BloomFilterRebuilder rebuilder;
+    private final BloomFilterProperties properties;
 
     /**
+     * Read-only endpoint.
+     *
      * @param registry the filters
      */
     public BloomFiltersEndpoint(BloomFilterRegistry registry) {
+        this(registry, null, null);
+    }
+
+    /**
+     * @param registry   the filters
+     * @param rebuilder  the rebuilder, or {@code null}
+     * @param properties the configuration, or {@code null}
+     */
+    public BloomFiltersEndpoint(BloomFilterRegistry registry, BloomFilterRebuilder rebuilder,
+                                BloomFilterProperties properties) {
         this.registry = registry;
+        this.rebuilder = rebuilder;
+        this.properties = properties;
     }
 
     /**
@@ -45,7 +65,29 @@ public class BloomFiltersEndpoint {
         return registry.names().contains(name) ? describe(registry.managed(name)) : null;
     }
 
-    private static Map<String, Object> describe(ManagedBloomFilter filter) {
+    /**
+     * Starts a rebuild in the background.
+     *
+     * @param name filter name
+     * @return the request status, or {@code null} (HTTP 404) if unknown
+     */
+    @WriteOperation
+    public Map<String, Object> rebuild(@Selector String name) {
+        if (!registry.names().contains(name)) {
+            return null;
+        }
+        if (rebuilder == null || properties == null || !properties.getRebuild().isEndpointEnabled()) {
+            return Map.of("filter", name, "status", "disabled",
+                    "hint", "set bloom.rebuild.endpoint-enabled=true and secure the actuator endpoints");
+        }
+        if (registry.managed(name).isRebuilding()) {
+            return Map.of("filter", name, "status", "already-running");
+        }
+        rebuilder.rebuildAsync(name);
+        return Map.of("filter", name, "status", "started");
+    }
+
+    private Map<String, Object> describe(ManagedBloomFilter filter) {
         BloomFilterSpec spec = filter.spec();
         Map<String, Object> d = new LinkedHashMap<>();
         d.put("backend", filter.backend());
@@ -73,6 +115,15 @@ public class BloomFiltersEndpoint {
         counters.put("falsePositives", filter.falsePositiveCount());
         counters.put("backendErrors", filter.backendErrors());
         d.put("counters", counters);
+
+        Map<String, Object> rebuild = new LinkedHashMap<>();
+        rebuild.put("running", filter.isRebuilding());
+        rebuild.put("successes", filter.rebuildSuccessCount());
+        rebuild.put("failures", filter.rebuildFailureCount());
+        rebuild.put("lastSuccess", filter.lastRebuild() == null ? null : filter.lastRebuild().toString());
+        BloomFilterProperties.Filter config = properties == null ? null : properties.getFilters().get(filter.name());
+        rebuild.put("cron", config == null ? null : config.getRebuildCron());
+        d.put("rebuild", rebuild);
         return d;
     }
 }

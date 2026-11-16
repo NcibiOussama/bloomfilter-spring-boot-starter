@@ -13,6 +13,7 @@ import java.util.function.ToDoubleFunction;
  * <ul>
  *     <li>{@code bloom.filter.checks} with {@code result} = {@code might_contain}, {@code absent}, {@code bypassed}</li>
  *     <li>{@code bloom.filter.puts}, {@code bloom.filter.false.positives}, {@code bloom.filter.backend.errors}</li>
+ *     <li>{@code bloom.filter.rebuilds} with {@code result} = {@code success}, {@code failure}</li>
  *     <li>{@code bloom.filter.fill.ratio}, {@code bloom.filter.estimated.false.positive.rate},
  *         {@code bloom.filter.approximate.elements}, {@code bloom.filter.ready}</li>
  * </ul>
@@ -46,6 +47,10 @@ public class BloomFilterMeterBinder implements MeterBinder {
                     "Checks that passed the filter but found nothing");
             counter(meters, "bloom.filter.backend.errors", filter, ManagedBloomFilter::backendErrors, tags,
                     "Backend failures");
+            counter(meters, "bloom.filter.rebuilds", filter, ManagedBloomFilter::rebuildSuccessCount,
+                    tags.and("result", "success"), "Completed rebuilds");
+            counter(meters, "bloom.filter.rebuilds", filter, ManagedBloomFilter::rebuildFailureCount,
+                    tags.and("result", "failure"), "Failed rebuilds");
 
             CachedStats stats = new CachedStats(filter);
             Gauge.builder("bloom.filter.fill.ratio", stats, s -> s.get(BloomFilterStats::fillRatio))
