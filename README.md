@@ -192,12 +192,24 @@ See [SECURITY.md](SECURITY.md) to report a vulnerability.
 | `bloom.max-key-bytes` | `4096` | Reject larger keys |
 | `bloom.max-bits-per-filter` | `4294967296` | Reject larger filters |
 
-## Limitations
+## Good to know
 
-- Single keys can't be removed (standard Bloom filter); use a scheduled rebuild to drop deleted keys.
-- Rebuilding requires a `BloomFilterLoader` for the filter. Without one, a `DEGRADED` filter stays in bypass
-  mode until restart.
-- Annotations work on calls through the Spring proxy, not on self-invocation (same as `@Transactional`).
+These come from how Bloom filters and Spring proxies work, not from this library. Here's how to handle each:
+
+- **Removing keys.** A Bloom filter can't remove a single key: its bits are shared with other keys, and clearing
+  them would make those keys look absent. Deleted keys only cost a few extra false positives (a database lookup,
+  never a wrong answer). To drop them, set `rebuild-cron`, for example nightly.
+- **Rebuilding needs a loader.** To rebuild, the library reloads every key through your `BloomFilterLoader`.
+  Without a loader, a `DEGRADED` filter can't repair itself, but it stays safe: it answers "maybe" (so your
+  database is used) until the application restarts.
+- **Self-invocation.** Like `@Transactional` and `@Cacheable`, `@BloomCheck` and `@BloomAdd` only apply when the
+  method is called from another bean, through the Spring proxy. Inside the same class, check the filter directly:
+
+  ```java
+  if (!registry.get("users").mightContain(id)) {
+      return Optional.empty();
+  }
+  ```
 
 ## Build
 
