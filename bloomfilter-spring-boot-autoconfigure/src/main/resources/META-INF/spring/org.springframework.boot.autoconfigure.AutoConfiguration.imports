@@ -1,0 +1,3 @@
+io.github.ncibioussama.bloomfilter.autoconfigure.BloomFilterAutoConfiguration
+io.github.ncibioussama.bloomfilter.autoconfigure.BloomFilterMetricsAutoConfiguration
+io.github.ncibioussama.bloomfilter.autoconfigure.BloomFilterEndpointAutoConfiguration
