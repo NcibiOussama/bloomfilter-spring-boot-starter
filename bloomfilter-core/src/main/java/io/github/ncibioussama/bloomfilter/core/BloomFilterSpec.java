@@ -78,7 +78,7 @@ public record BloomFilterSpec(String name, long expectedInsertions, double false
         }
         double rawBits = Math.ceil(-expectedInsertions * Math.log(falsePositiveRate) / LN2_SQUARED);
         if (rawBits > maxBits) {
-            throw new IllegalArgumentException(String.format(
+            throw new IllegalArgumentException(String.format(java.util.Locale.ROOT,
                     "Bloom filter '%s' needs %.0f bits (~%.1f MiB) for %d insertions at %s false-positive rate, "
                             + "which exceeds the limit of %d bits (~%.1f MiB). Lower expectedInsertions, raise "
                             + "falsePositiveRate or raise the limit.",

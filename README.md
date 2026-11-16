@@ -4,7 +4,7 @@
 [![CI](https://github.com/NcibiOussama/bloomfilter-spring-boot-starter/actions/workflows/ci.yml/badge.svg)](https://github.com/NcibiOussama/bloomfilter-spring-boot-starter/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue)](LICENSE)
 
-Secure, observable, declarative Bloom filters for Spring Boot 3.
+Secure, observable, declarative Bloom filters for Spring Boot 3.5 and 4.
 
 - **One dependency, a few lines of YAML.** In-memory or Redis backend, switchable by configuration.
 - **Annotations:** `@BloomCheck` short-circuits lookups of keys that definitely don't exist; `@BloomAdd` keeps
@@ -20,17 +20,17 @@ Secure, observable, declarative Bloom filters for Spring Boot 3.
 <dependency>
   <groupId>io.github.ncibioussama</groupId>
   <artifactId>bloomfilter-spring-boot-starter</artifactId>
-  <version>0.1.0</version>
+  <version>0.2.0</version>
 </dependency>
 ```
 
 Gradle:
 
 ```groovy
-implementation 'io.github.ncibioussama:bloomfilter-spring-boot-starter:0.1.0'
+implementation 'io.github.ncibioussama:bloomfilter-spring-boot-starter:0.2.0'
 ```
 
-Requires Java 17+ and Spring Boot 3.x.
+Requires Java 17+. Works with **Spring Boot 3.5 and 4.x** from the same artifact (both tested in CI).
 
 ## Configure
 

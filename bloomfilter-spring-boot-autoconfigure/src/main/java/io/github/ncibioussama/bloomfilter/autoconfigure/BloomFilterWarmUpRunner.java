@@ -60,7 +60,7 @@ public class BloomFilterWarmUpRunner implements ApplicationRunner, Ordered {
             throw new IllegalStateException("Warm-up of Bloom filter '" + filter.name() + "' failed", e);
         }
         filter.markReady();
-        log.info(String.format("Bloom filter '%s' warmed up in %d ms (%d keys)", filter.name(),
+        log.info(String.format(java.util.Locale.ROOT, "Bloom filter '%s' warmed up in %d ms (%d keys)", filter.name(),
                 (System.nanoTime() - start) / 1_000_000, filter.putCount()));
     }
 

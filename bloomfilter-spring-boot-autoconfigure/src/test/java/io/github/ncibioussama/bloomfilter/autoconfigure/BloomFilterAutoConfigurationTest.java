@@ -2,12 +2,14 @@ package io.github.ncibioussama.bloomfilter.autoconfigure;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.Mockito.mock;
 
 import io.github.ncibioussama.bloomfilter.annotation.BloomAdd;
 import io.github.ncibioussama.bloomfilter.annotation.BloomCheck;
 import io.github.ncibioussama.bloomfilter.annotation.BloomFilterMissException;
 import io.github.ncibioussama.bloomfilter.annotation.OnMiss;
 import io.github.ncibioussama.bloomfilter.core.BloomFilter;
+import io.github.ncibioussama.bloomfilter.redis.RedisBloomFilter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.util.List;
@@ -16,16 +18,18 @@ import java.util.Optional;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.springframework.boot.DefaultApplicationArguments;
+import org.springframework.aop.framework.autoproxy.InfrastructureAdvisorAutoProxyCreator;
 import org.springframework.boot.autoconfigure.AutoConfigurations;
-import org.springframework.boot.autoconfigure.aop.AopAutoConfiguration;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.data.redis.connection.RedisConnectionFactory;
 
 class BloomFilterAutoConfigurationTest {
 
     private final ApplicationContextRunner runner = new ApplicationContextRunner()
-            .withConfiguration(AutoConfigurations.of(AopAutoConfiguration.class, BloomFilterAutoConfiguration.class,
+            .withUserConfiguration(InfrastructureProxyConfig.class)
+            .withConfiguration(AutoConfigurations.of(BloomFilterAutoConfiguration.class,
                     BloomFilterMetricsAutoConfiguration.class))
             .withPropertyValues(
                     "bloom.filters.users.expected-insertions=1000",
@@ -69,6 +73,33 @@ class BloomFilterAutoConfigurationTest {
         runner.withPropertyValues("bloom.security.secret=tooshort")
                 .run(context -> assertThat(context).getFailure()
                         .rootCause().hasMessageContaining("at least 16 bytes"));
+    }
+
+    @Test
+    void redisBackendIsWiredWhenAConnectionFactoryExists() {
+        runner.withPropertyValues("bloom.filters.users.backend=redis",
+                        "bloom.security.secret=0123456789abcdef-test",
+                        "bloom.redis.key-prefix=bloom:test:")
+                .withBean(RedisConnectionFactory.class, () -> mock(RedisConnectionFactory.class))
+                .run(context -> {
+                    ManagedBloomFilter users = context.getBean(BloomFilterRegistry.class).managed("users");
+                    assertThat(users.backend()).isEqualTo("redis");
+                    assertThat(users.delegate()).isInstanceOf(RedisBloomFilter.class);
+                    assertThat(((RedisBloomFilter) users.delegate()).redisKey()).startsWith("bloom:test:users:");
+                });
+    }
+
+    @Test
+    void actuatorEndpointIsRegisteredWhenExposed() {
+        runner.withConfiguration(AutoConfigurations.of(BloomFilterEndpointAutoConfiguration.class))
+                .withPropertyValues("management.endpoints.web.exposure.include=bloomfilters")
+                .run(context -> assertThat(context).hasSingleBean(BloomFiltersEndpoint.class));
+    }
+
+    @Test
+    void sizesAreFormattedReadably() {
+        assertThat(BloomFilterAutoConfiguration.formatSize(1_200)).isEqualTo("1.2 KiB");
+        assertThat(BloomFilterAutoConfiguration.formatSize(1_198_136)).isEqualTo("1.14 MiB");
     }
 
     @Test
@@ -152,6 +183,20 @@ class BloomFilterAutoConfigurationTest {
             assertThat(users.toString()).doesNotContain("secret@example.com");
             assertThat(endpoint.filter("missing")).isNull();
         });
+    }
+
+    /**
+     * The proxy creator Spring Boot registers when AspectJ is absent (same as for @Transactional).
+     * It only applies infrastructure-role advisors, so this also verifies our advisor's @Role.
+     */
+    @Configuration(proxyBeanMethods = false)
+    static class InfrastructureProxyConfig {
+        @Bean
+        static InfrastructureAdvisorAutoProxyCreator infrastructureAdvisorAutoProxyCreator() {
+            InfrastructureAdvisorAutoProxyCreator creator = new InfrastructureAdvisorAutoProxyCreator();
+            creator.setProxyTargetClass(true);
+            return creator;
+        }
     }
 
     @Configuration(proxyBeanMethods = false)
