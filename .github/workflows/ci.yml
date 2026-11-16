@@ -25,6 +25,20 @@ jobs:
       - name: Build and test
         run: ./mvnw -B -ntp verify
 
+  # Same sources and tests against Spring Boot 4 (Spring Framework 7). Releases are built on the
+  # Boot 3.5 baseline; this job guarantees the published jars keep working on Boot 4.
+  build-boot4:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: maven
+      - name: Build and test on Spring Boot 4
+        run: ./mvnw -B -ntp -Pspring-boot-4 verify
+
   dependency-review:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest

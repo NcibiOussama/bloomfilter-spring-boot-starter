@@ -9,6 +9,7 @@ import io.github.ncibioussama.bloomfilter.redis.RedisBloomFilter;
 import java.util.EnumMap;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -88,12 +89,19 @@ public class BloomFilterAutoConfiguration {
             ManagedBloomFilter.State state = loaded.contains(name)
                     ? ManagedBloomFilter.State.WARMING_UP : ManagedBloomFilter.State.READY;
             filters.put(name, new ManagedBloomFilter(filter, type.name().toLowerCase(), state));
-            log.info(String.format("Bloom filter '%s': backend=%s, expected-insertions=%d, "
-                            + "false-positive-rate=%s, size=%.2f MiB, hash-functions=%d", name,
-                    type.name().toLowerCase(), spec.expectedInsertions(), spec.falsePositiveRate(),
-                    spec.bitSize() / 8.0 / 1024 / 1024, spec.hashFunctions()));
+            log.info(String.format(Locale.ROOT, "Bloom filter '%s': backend=%s, expected-insertions=%d, "
+                            + "false-positive-rate=%s, size=%s, hash-functions=%d", name,
+                    type.name().toLowerCase(Locale.ROOT), spec.expectedInsertions(), spec.falsePositiveRate(),
+                    formatSize(spec.bitSize() / 8), spec.hashFunctions()));
         });
         return new BloomFilterRegistry(filters);
+    }
+
+    static String formatSize(long bytes) {
+        if (bytes < 1024 * 1024) {
+            return String.format(Locale.ROOT, "%.1f KiB", bytes / 1024.0);
+        }
+        return String.format(Locale.ROOT, "%.2f MiB", bytes / 1024.0 / 1024.0);
     }
 
     private static String missingBackendMessage(String name, Backend type) {
