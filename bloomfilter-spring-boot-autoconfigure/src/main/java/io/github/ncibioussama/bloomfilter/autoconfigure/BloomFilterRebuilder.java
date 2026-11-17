@@ -2,6 +2,7 @@ package io.github.ncibioussama.bloomfilter.autoconfigure;
 
 import io.github.ncibioussama.bloomfilter.core.RebuildSession;
 import io.github.ncibioussama.bloomfilter.core.Rebuildable;
+import io.github.ncibioussama.bloomfilter.core.Suspendable;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.LinkedHashMap;
@@ -27,6 +28,9 @@ import org.springframework.util.StringUtils;
  * A rebuild loads every existing key into a fresh filter while the current one keeps answering, then swaps
  * it in atomically (see {@link Rebuildable}). This removes deleted keys and repairs filters that missed writes.
  * With a shared backend, only one application instance rebuilds a filter at a time.
+ * <p>
+ * For writes that bypass the application (SQL migrations, bulk imports, other services), {@link #suspend(String)}
+ * the filter first and {@link #resume(String)} it afterwards: no check answers "absent" in between.
  */
 public class BloomFilterRebuilder implements SmartLifecycle {
 
@@ -43,7 +47,9 @@ public class BloomFilterRebuilder implements SmartLifecycle {
         /** The backend does not support rebuilds. */
         NOT_SUPPORTED,
         /** Loading or swapping failed; the filter kept its previous content. */
-        FAILED
+        FAILED,
+        /** {@link #resume(String)} rebuilt the filter, but it was suspended again meanwhile and stays suspended. */
+        SUSPENDED_AGAIN
     }
 
     /**
@@ -166,6 +172,95 @@ public class BloomFilterRebuilder implements SmartLifecycle {
         filter.markRecovered();
         return result(name, Outcome.COMPLETED, start,
                 "~" + filter.stats().approximateElementCount() + " keys");
+    }
+
+    /**
+     * Suspends a filter before writes that bypass the application, such as a SQL migration or a bulk import:
+     * from the moment this method returns, every check answers "might contain", on every instance sharing the
+     * filter. Writes still reach the filter. Scheduled and automatic rebuilds do not end the suspension; call
+     * {@link #resume(String)} once the writes are done.
+     *
+     * @param name the filter name
+     * @throws IllegalArgumentException      if no such filter is configured
+     * @throws UnsupportedOperationException if the backend cannot be suspended
+     * @throws io.github.ncibioussama.bloomfilter.core.BloomFilterUnavailableException if the suspension could
+     *                                       not be recorded (the filter is then <em>not</em> suspended)
+     */
+    public void suspend(String name) {
+        ManagedBloomFilter filter = registry.managed(name);
+        if (!(filter.delegate() instanceof Suspendable suspendable)) {
+            throw new UnsupportedOperationException(filter.backend() + " backend cannot be suspended");
+        }
+        suspendable.suspend();
+        log.warn("Bloom filter '" + name + "' suspended: every check answers 'might contain' until it is resumed");
+    }
+
+    /**
+     * Ends a suspension: rebuilds the filter from its {@link BloomFilterLoader}, so it contains the rows written
+     * while it was suspended, then lets it answer checks again. If the filter was suspended again during the
+     * rebuild, it stays suspended ({@link Outcome#SUSPENDED_AGAIN}). On any other outcome than
+     * {@link Outcome#COMPLETED} the filter also stays suspended, which is safe; call this method again.
+     *
+     * @param name the filter name
+     * @return the result
+     * @throws IllegalArgumentException if no such filter is configured
+     */
+    public Result resume(String name) {
+        ManagedBloomFilter filter = registry.managed(name);
+        long start = System.nanoTime();
+        if (!(filter.delegate() instanceof Suspendable suspendable)) {
+            return result(name, Outcome.NOT_SUPPORTED, start, filter.backend() + " backend cannot be suspended");
+        }
+        String token;
+        try {
+            token = suspendable.suspension();
+        } catch (RuntimeException e) {
+            return result(name, Outcome.FAILED, start, e.getMessage() + "; the filter stays suspended");
+        }
+        Result rebuilt = rebuild(name);
+        if (rebuilt.outcome() != Outcome.COMPLETED) {
+            return result(name, rebuilt.outcome(), start, rebuilt.message() + "; the filter stays suspended");
+        }
+        try {
+            if (token != null && !suspendable.resume(token)) {
+                Result again = result(name, Outcome.SUSPENDED_AGAIN, start,
+                        "suspended again during the rebuild; the filter stays suspended");
+                log(again);
+                return again;
+            }
+        } catch (RuntimeException e) {
+            return result(name, Outcome.FAILED, start, e.getMessage() + "; the filter stays suspended");
+        }
+        if (token != null) {
+            log.info("Bloom filter '" + name + "' resumed after a rebuild: " + rebuilt.message());
+        }
+        return result(name, Outcome.COMPLETED, start, rebuilt.message());
+    }
+
+    /**
+     * {@link #resume(String)} in the background.
+     *
+     * @param name the filter name
+     * @return the future result
+     * @throws IllegalArgumentException if no such filter is configured
+     */
+    public CompletableFuture<Result> resumeAsync(String name) {
+        registry.managed(name); // fail fast on unknown names
+        ThreadPoolTaskScheduler current = scheduler;
+        if (current == null) {
+            return CompletableFuture.completedFuture(resume(name));
+        }
+        return CompletableFuture.supplyAsync(() -> resume(name), current);
+    }
+
+    /**
+     * @param name the filter name
+     * @return whether the filter is suspended
+     * @throws IllegalArgumentException if no such filter is configured
+     */
+    public boolean isSuspended(String name) {
+        return registry.managed(name).delegate() instanceof Suspendable suspendable
+                && suspendable.suspension() != null;
     }
 
     /**

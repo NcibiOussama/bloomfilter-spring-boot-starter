@@ -102,6 +102,31 @@ class RedisBloomFilterTest {
     }
 
     @Test
+    void suspensionIsSharedByEveryInstanceAndSurvivesRebuilds() {
+        RedisBloomFilter a = filter("users", FailureMode.THROW);
+        RedisBloomFilter b = filter("users", FailureMode.THROW);   // another application instance
+        a.put("alice");
+        assertThat(b.mightContain("bob")).isFalse();
+
+        String token = a.suspend();
+        assertThat(b.suspension()).isEqualTo(token);
+        assertThat(b.mightContain("bob")).as("suspended on every instance").isTrue();
+        b.put("carol");
+
+        RebuildSession session = b.beginRebuild(Duration.ofMinutes(1));
+        session.target().putAll(List.of("alice", "carol"));
+        assertThat(session.target().mightContain("bob")).as("rebuild target is not suspended").isFalse();
+        assertThat(session.commit()).isTrue();
+        assertThat(a.mightContain("bob")).as("a rebuild does not end a suspension").isTrue();
+
+        assertThat(b.resume("someone-else")).isFalse();
+        assertThat(b.resume(token)).isTrue();
+        assertThat(a.suspension()).isNull();
+        assertThat(a.mightContain("bob")).isFalse();
+        assertThat(a.mightContain("carol")).isTrue();
+    }
+
+    @Test
     void redisNeverStoresKeysInPlainText() {
         RedisBloomFilter filter = filter("emails", FailureMode.THROW);
         filter.putAll(List.of("alice@example.com", "bob@example.com"));
@@ -229,6 +254,8 @@ class RedisBloomFilterTest {
             assertThat(open.mightContain("anything")).isTrue();
             assertThat(open.put("anything")).isFalse();
             assertThat(open.backendErrors()).isEqualTo(2);
+            // An unrecorded suspension would protect nothing, so suspend never fails open.
+            assertThatThrownBy(open::suspend).isInstanceOf(BloomFilterUnavailableException.class);
 
             RedisBloomFilter strict = new RedisBloomFilter(BloomFilterSpec.of("f", 100, 0.01), hash,
                     new DefaultKeyEncoder(), deadTemplate, "bloom:", FailureMode.THROW, 10);

@@ -13,6 +13,7 @@ Its tests check every feature end to end.
 | Nightly `rebuild-cron`, rebuild via actuator | `application.yml` |
 | `/actuator/bloomfilters` and Micrometer metrics | `application.yml` |
 | Shared filters in Redis, keyed SipHash | `application-redis.yml` |
+| Suspend / resume around a SQL migration | `MigrationTest` |
 
 ## Run it
 
@@ -58,6 +59,9 @@ export BLOOM_SECURITY_SECRET="$(openssl rand -hex 32)"   # same value on every i
   because the degraded filter is bypassed. Once Redis is back, the filter rebuilds itself from the database,
   including the user created during the outage, and rejects unknown ids again.
 - **`RedisFailClosedTest`**: with `failure-mode: throw`, an outage returns an error (5xx), never a 404.
+- **`MigrationTest`**: a row inserted with plain SQL is wrongly "not found" until a rebuild. With
+  `POST .../users/suspend` before and `.../resume` after the migration, every answer stays correct, on both
+  instances sharing Redis.
 - **`SecurityTest`**: hostile input over HTTP. Keys above `max-key-bytes` cause no error and cannot switch the
   filter off. SpEL, placeholder and control-character payloads are treated as plain data. Emails never appear
   in responses, error bodies, `/actuator/bloomfilters`, metrics or logs.

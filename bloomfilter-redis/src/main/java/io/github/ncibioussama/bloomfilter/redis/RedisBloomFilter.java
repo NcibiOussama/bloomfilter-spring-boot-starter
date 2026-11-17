@@ -10,6 +10,7 @@ import io.github.ncibioussama.bloomfilter.core.KeyEncoder;
 import io.github.ncibioussama.bloomfilter.core.KeyTooLargeException;
 import io.github.ncibioussama.bloomfilter.core.RebuildSession;
 import io.github.ncibioussama.bloomfilter.core.Rebuildable;
+import io.github.ncibioussama.bloomfilter.core.Suspendable;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -40,11 +41,12 @@ import org.springframework.data.redis.core.script.RedisScript;
  *     <li>{@code ...:ready}: set once a complete load or rebuild finished</li>
  *     <li>{@code ...:next}: the bitmap being rebuilt</li>
  *     <li>{@code ...:rebuild}: rebuild lock and dual-write signal, with an expiry</li>
+ *     <li>{@code ...:suspended}: present while the filter is {@link Suspendable suspended} on every instance</li>
  * </ul>
  * The fingerprint covers the sizing and hash configuration, so changing size, algorithm or secret
  * switches to a fresh bitmap instead of reading incompatible bits (which would cause false negatives).
  */
-public final class RedisBloomFilter implements BloomFilter, Rebuildable {
+public final class RedisBloomFilter implements BloomFilter, Rebuildable, Suspendable {
 
     private static final Log log = LogFactory.getLog(RedisBloomFilter.class);
     private static final long WARN_INTERVAL_MILLIS = 30_000;
@@ -94,8 +96,9 @@ public final class RedisBloomFilter implements BloomFilter, Rebuildable {
             return newKeys
             """, Long.class);
 
-    /** KEYS: bitmap. ARGV: bit indexes. */
+    /** KEYS: bitmap, optional suspension marker. ARGV: bit indexes. A suspended filter contains everything. */
     private static final RedisScript<Long> CONTAINS_SCRIPT = new DefaultRedisScript<>("""
+            if KEYS[2] and redis.call('EXISTS', KEYS[2]) == 1 then return 1 end
             for i = 1, #ARGV do
               if redis.call('GETBIT', KEYS[1], ARGV[i]) == 0 then return 0 end
             end
@@ -124,6 +127,15 @@ public final class RedisBloomFilter implements BloomFilter, Rebuildable {
             return 1
             """, Long.class);
 
+    /** KEYS: suspension marker. ARGV: token. Ends the suspension only if it is still this one. */
+    private static final RedisScript<Long> RESUME_SCRIPT = new DefaultRedisScript<>("""
+            if redis.call('GET', KEYS[1]) == ARGV[1] then
+              redis.call('DEL', KEYS[1])
+              return 1
+            end
+            return 0
+            """, Long.class);
+
     /** KEYS: rebuild marker, next. ARGV: token. */
     private static final RedisScript<Long> ABORT_REBUILD_SCRIPT = new DefaultRedisScript<>("""
             if redis.call('GET', KEYS[1]) == ARGV[1] then
@@ -146,6 +158,7 @@ public final class RedisBloomFilter implements BloomFilter, Rebuildable {
     private final String readyKey;
     private final String nextKey;
     private final String rebuildKey;
+    private final String suspendedKey;
     private final LongAdder errors = new LongAdder();
     private final AtomicLong lastWarn = new AtomicLong();
 
@@ -181,6 +194,7 @@ public final class RedisBloomFilter implements BloomFilter, Rebuildable {
         this.readyKey = redisKey + ":ready";
         this.nextKey = redisKey + ":next";
         this.rebuildKey = redisKey + ":rebuild";
+        this.suspendedKey = redisKey + ":suspended";
     }
 
     /**
@@ -197,7 +211,7 @@ public final class RedisBloomFilter implements BloomFilter, Rebuildable {
             return true; // oversized keys are never stored: "might contain" sends the caller to the source of truth
         }
         try {
-            Long result = redis.execute(CONTAINS_SCRIPT, List.of(redisKey), args.toArray());
+            Long result = redis.execute(CONTAINS_SCRIPT, List.of(redisKey, suspendedKey), args.toArray());
             return result == null || result != 0;
         } catch (DataAccessException e) {
             onError("mightContain", e);
@@ -320,6 +334,44 @@ public final class RedisBloomFilter implements BloomFilter, Rebuildable {
     @Override
     public long backendErrors() {
         return errors.sum();
+    }
+
+    /**
+     * {@inheritDoc}
+     * The marker is stored in Redis without expiry, so every instance bypasses the filter until
+     * {@link #resume(String)}. Never fails open: an unrecorded suspension would not protect anything.
+     */
+    @Override
+    public String suspend() {
+        String token = UUID.randomUUID().toString();
+        try {
+            redis.opsForValue().set(suspendedKey, token);
+            return token;
+        } catch (DataAccessException e) {
+            throw unavailable("suspend", e);
+        }
+    }
+
+    @Override
+    public String suspension() {
+        try {
+            return redis.opsForValue().get(suspendedKey);
+        } catch (DataAccessException e) {
+            throw unavailable("suspension", e);
+        }
+    }
+
+    @Override
+    public boolean resume(String token) {
+        if (token == null) {
+            return false;
+        }
+        try {
+            Long resumed = redis.execute(RESUME_SCRIPT, List.of(suspendedKey), token);
+            return resumed != null && resumed == 1;
+        } catch (DataAccessException e) {
+            throw unavailable("resume", e);
+        }
     }
 
     @Override

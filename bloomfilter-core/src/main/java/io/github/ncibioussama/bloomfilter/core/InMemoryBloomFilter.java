@@ -1,6 +1,8 @@
 package io.github.ncibioussama.bloomfilter.core;
 
 import java.time.Duration;
+import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicLongArray;
 import java.util.concurrent.atomic.LongAdder;
 
@@ -12,7 +14,7 @@ import java.util.concurrent.atomic.LongAdder;
  * {@code put} writes to both, then swapped in with a single reference assignment. A rebuild needs
  * twice the filter's memory until it is committed.
  */
-public final class InMemoryBloomFilter implements BloomFilter, Rebuildable {
+public final class InMemoryBloomFilter implements BloomFilter, Rebuildable, Suspendable {
 
     private final BloomFilterSpec spec;
     private final HashStrategy hashStrategy;
@@ -25,6 +27,9 @@ public final class InMemoryBloomFilter implements BloomFilter, Rebuildable {
      */
     private volatile Bits current;
     private volatile Bits next;
+
+    /** Token of the current suspension, or {@code null}. */
+    private final AtomicReference<String> suspension = new AtomicReference<>();
 
     /**
      * Creates a filter keyed with a random SipHash key and the default key encoder.
@@ -62,6 +67,9 @@ public final class InMemoryBloomFilter implements BloomFilter, Rebuildable {
 
     @Override
     public boolean mightContain(Object key) {
+        if (suspension.get() != null) {
+            return true; // suspended: callers use their source of truth
+        }
         long[] indexes = indexes(key);
         if (indexes == null) {
             return true; // oversized keys are never stored: "might contain" sends the caller to the source of truth
@@ -116,6 +124,23 @@ public final class InMemoryBloomFilter implements BloomFilter, Rebuildable {
     @Override
     public void clear() {
         current.clear();
+    }
+
+    @Override
+    public String suspend() {
+        String token = UUID.randomUUID().toString();
+        suspension.set(token);
+        return token;
+    }
+
+    @Override
+    public String suspension() {
+        return suspension.get();
+    }
+
+    @Override
+    public boolean resume(String token) {
+        return token != null && suspension.compareAndSet(token, null);
     }
 
     @Override

@@ -40,6 +40,33 @@ class InMemoryBloomFilterTest {
     }
 
     @Test
+    void suspendedFilterContainsEverythingUntilResumedWithItsToken() {
+        InMemoryBloomFilter filter = new InMemoryBloomFilter(BloomFilterSpec.of("t", 1_000, 0.01));
+        filter.put("a");
+        assertThat(filter.mightContain("b")).isFalse();
+
+        String first = filter.suspend();
+        assertThat(filter.suspension()).isEqualTo(first);
+        assertThat(filter.mightContain("b")).isTrue();
+        filter.put("c");                                   // writes still land
+
+        String second = filter.suspend();                  // a newer suspension replaces the first
+        assertThat(filter.resume(first)).as("stale token").isFalse();
+        assertThat(filter.mightContain("b")).isTrue();
+
+        RebuildSession session = filter.beginRebuild(Duration.ofMinutes(1));
+        session.target().putAll(List.of("a", "c"));
+        assertThat(session.commit()).isTrue();
+        assertThat(filter.mightContain("b")).as("a rebuild does not end a suspension").isTrue();
+
+        assertThat(filter.resume(second)).isTrue();
+        assertThat(filter.suspension()).isNull();
+        assertThat(filter.mightContain("b")).isFalse();
+        assertThat(filter.mightContain("c")).isTrue();
+        assertThat(filter.resume(null)).isFalse();
+    }
+
+    @Test
     void invalidKeysStillThrow() {
         BloomFilter filter = new InMemoryBloomFilter(BloomFilterSpec.of("t", 1_000, 0.01));
         assertThatThrownBy(() -> filter.put(null)).isInstanceOf(IllegalArgumentException.class);
