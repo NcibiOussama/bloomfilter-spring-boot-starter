@@ -12,6 +12,7 @@ import io.github.ncibioussama.bloomfilter.core.BloomFilter;
 import io.github.ncibioussama.bloomfilter.redis.RedisBloomFilter;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -142,6 +143,63 @@ class BloomFilterAutoConfigurationTest {
     }
 
     @Test
+    void oversizedKeysNeitherDegradeTheFilterNorBlockStartupOrChecks() {
+        String oversized = "x".repeat(65);
+        runner.withPropertyValues("bloom.max-key-bytes=64")
+                .withUserConfiguration(StringUserServiceConfig.class)
+                .withBean(BloomFilterLoader.class, () -> new BloomFilterLoader() {
+                    public String filterName() {
+                        return "users";
+                    }
+
+                    public void load(BloomFilter filter) {
+                        filter.putAll(List.of("alice", oversized));   // e.g. a row an attacker created
+                    }
+                })
+                .run(context -> {
+                    context.getBean(BloomFilterWarmUpRunner.class).run(new DefaultApplicationArguments());
+                    ManagedBloomFilter users = context.getBean(BloomFilterRegistry.class).managed("users");
+                    assertThat(users.state()).isEqualTo(ManagedBloomFilter.State.READY);
+
+                    StringUserService service = context.getBean(StringUserService.class);
+                    service.create(oversized + "-new");                  // @BloomAdd: not stored, not degraded
+                    assertThat(users.state()).isEqualTo(ManagedBloomFilter.State.READY);
+                    assertThat(service.find(oversized)).as("answered by the source of truth").contains(oversized);
+                    assertThat(service.find("alice")).contains("alice");
+                    assertThat(service.find("nobody")).isEmpty();
+                    assertThat(service.calls()).isEqualTo(2);
+
+                    assertThat(context.getBean(BloomFilterRebuilder.class).rebuild("users").outcome())
+                            .isEqualTo(BloomFilterRebuilder.Outcome.COMPLETED);
+                });
+    }
+
+    @Test
+    void invalidKeysThrowButDoNotDegradeTheFilter() {
+        runner.run(context -> {
+            ManagedBloomFilter users = context.getBean(BloomFilterRegistry.class).managed("users");
+            assertThatThrownBy(() -> users.put(new Object())).isInstanceOf(IllegalArgumentException.class);
+            assertThatThrownBy(() -> users.putAll(Arrays.asList("a", null)))
+                    .isInstanceOf(IllegalArgumentException.class);
+            assertThat(users.state()).isEqualTo(ManagedBloomFilter.State.READY);
+        });
+    }
+
+    @Test
+    void keyExpressionsTreatUserInputAsData() {
+        runner.withUserConfiguration(StringUserServiceConfig.class).run(context -> {
+            StringUserService service = context.getBean(StringUserService.class);
+            BloomFilter users = context.getBean(BloomFilterRegistry.class).get("users");
+            String injection = "#{T(java.lang.System).exit(1)} ' + T(java.lang.Runtime).getRuntime() + ' #root";
+            assertThat(service.find(injection)).isEmpty();
+            assertThat(service.calls()).isZero();
+            service.create(injection);
+            assertThat(users.mightContain(injection)).isTrue();
+            assertThat(service.find(injection)).contains(injection);
+        });
+    }
+
+    @Test
     void loaderForUnknownFilterFailsStartup() {
         runner.withBean(BloomFilterLoader.class, () -> new BloomFilterLoader() {
                     public String filterName() {
@@ -222,6 +280,34 @@ class BloomFilterAutoConfigurationTest {
                     filter.putAll(List.of(5L, 6L, 7L));
                 }
             };
+        }
+    }
+
+    @Configuration(proxyBeanMethods = false)
+    static class StringUserServiceConfig {
+        @Bean
+        StringUserService stringUserService() {
+            return new StringUserService();
+        }
+    }
+
+    /** Source of truth that knows every key except "nobody", so a check that reaches it returns the key. */
+    static class StringUserService {
+
+        private final AtomicInteger calls = new AtomicInteger();
+
+        public int calls() {
+            return calls.get();
+        }
+
+        @BloomCheck(filter = "users", key = "#name")
+        public Optional<String> find(String name) {
+            calls.incrementAndGet();
+            return "nobody".equals(name) ? Optional.empty() : Optional.of(name);
+        }
+
+        @BloomAdd(filter = "users", key = "#name")
+        public void create(String name) {
         }
     }
 

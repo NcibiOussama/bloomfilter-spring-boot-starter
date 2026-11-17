@@ -1,7 +1,9 @@
 package io.github.ncibioussama.bloomfilter.core;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -12,6 +14,39 @@ import java.util.stream.LongStream;
 import org.junit.jupiter.api.Test;
 
 class InMemoryBloomFilterTest {
+
+    @Test
+    void oversizedKeysAreNeverStoredAndAlwaysMightContain() {
+        InMemoryBloomFilter filter = new InMemoryBloomFilter(BloomFilterSpec.of("t", 1_000, 0.01),
+                SipHashStrategy.withRandomKey(), new DefaultKeyEncoder(64));
+        String oversized = "x".repeat(65);
+
+        assertThat(filter.put(oversized)).isFalse();
+        assertThat(filter.isEmpty()).as("nothing stored").isTrue();
+        assertThat(filter.mightContain(oversized)).as("never a wrong 'absent'").isTrue();
+
+        // A single oversized key in a bulk load is skipped; the other keys are added.
+        assertThat(filter.putAll(List.of("a", oversized, "b"))).isEqualTo(2);
+        assertThat(filter.mightContain("a")).isTrue();
+        assertThat(filter.mightContain("b")).isTrue();
+
+        // Rebuilds tolerate it too.
+        RebuildSession session = filter.beginRebuild(Duration.ofMinutes(1));
+        session.target().putAll(List.of("c", oversized));
+        assertThat(session.target().put(oversized)).isFalse();
+        assertThat(session.commit()).isTrue();
+        assertThat(filter.mightContain("c")).isTrue();
+        assertThat(filter.mightContain(oversized)).isTrue();
+    }
+
+    @Test
+    void invalidKeysStillThrow() {
+        BloomFilter filter = new InMemoryBloomFilter(BloomFilterSpec.of("t", 1_000, 0.01));
+        assertThatThrownBy(() -> filter.put(null)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> filter.mightContain(new Object()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .isNotInstanceOf(KeyTooLargeException.class);
+    }
 
     @Test
     void hasNoFalseNegatives() {

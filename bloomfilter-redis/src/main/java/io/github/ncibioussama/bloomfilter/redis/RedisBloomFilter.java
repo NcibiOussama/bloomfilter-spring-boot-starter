@@ -7,6 +7,7 @@ import io.github.ncibioussama.bloomfilter.core.BloomFilterUnavailableException;
 import io.github.ncibioussama.bloomfilter.core.FailureMode;
 import io.github.ncibioussama.bloomfilter.core.HashStrategy;
 import io.github.ncibioussama.bloomfilter.core.KeyEncoder;
+import io.github.ncibioussama.bloomfilter.core.KeyTooLargeException;
 import io.github.ncibioussama.bloomfilter.core.RebuildSession;
 import io.github.ncibioussama.bloomfilter.core.Rebuildable;
 import java.nio.charset.StandardCharsets;
@@ -192,6 +193,9 @@ public final class RedisBloomFilter implements BloomFilter, Rebuildable {
     @Override
     public boolean mightContain(Object key) {
         List<String> args = indexArgs(key, new ArrayList<>(spec.hashFunctions()));
+        if (args == null) {
+            return true; // oversized keys are never stored: "might contain" sends the caller to the source of truth
+        }
         try {
             Long result = redis.execute(CONTAINS_SCRIPT, List.of(redisKey), args.toArray());
             return result == null || result != 0;
@@ -204,6 +208,9 @@ public final class RedisBloomFilter implements BloomFilter, Rebuildable {
     @Override
     public boolean put(Object key) {
         List<String> args = indexArgs(key, new ArrayList<>(spec.hashFunctions()));
+        if (args == null) {
+            return false; // oversized keys are not stored; checks for them always answer "might contain"
+        }
         try {
             Long added = redis.execute(PUT_SCRIPT, List.of(redisKey, rebuildKey, nextKey), args.toArray());
             return added != null && added > 0;
@@ -229,7 +236,9 @@ public final class RedisBloomFilter implements BloomFilter, Rebuildable {
         args.add(Integer.toString(spec.hashFunctions()));
         int inBatch = 0;
         for (Object key : keys) {
-            indexArgs(key, args);
+            if (indexArgs(key, args) == null) {
+                continue; // oversized key: skipped, see KeyTooLargeException
+            }
             if (++inBatch == batchSize) {
                 newKeys += executeLong(script, redisKeys, args);
                 args.subList(1, args.size()).clear();
@@ -328,8 +337,15 @@ public final class RedisBloomFilter implements BloomFilter, Rebuildable {
         }
     }
 
+    /** Appends the key's bit indexes, or returns {@code null} (appending nothing) for an oversized key. */
     private List<String> indexArgs(Object key, List<String> target) {
-        for (long index : hashStrategy.indexes(keyEncoder.encode(key), spec.hashFunctions(), spec.bitSize())) {
+        byte[] encoded;
+        try {
+            encoded = keyEncoder.encode(key);
+        } catch (KeyTooLargeException e) {
+            return null;
+        }
+        for (long index : hashStrategy.indexes(encoded, spec.hashFunctions(), spec.bitSize())) {
             target.add(Long.toString(index));
         }
         return target;
@@ -412,6 +428,9 @@ public final class RedisBloomFilter implements BloomFilter, Rebuildable {
         @Override
         public boolean mightContain(Object key) {
             List<String> args = indexArgs(key, new ArrayList<>(spec.hashFunctions()));
+            if (args == null) {
+                return true;
+            }
             try {
                 Long result = redis.execute(CONTAINS_SCRIPT, List.of(nextKey), args.toArray());
                 return result == null || result != 0;

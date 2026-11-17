@@ -48,8 +48,7 @@ public final class DefaultKeyEncoder implements KeyEncoder {
         byte[] bytes = toBytes(key);
         if (bytes.length > maxKeyBytes) {
             // never include the key itself in the message: it may be sensitive (email, token, ...)
-            throw new IllegalArgumentException(
-                    "Bloom filter key is " + bytes.length + " bytes, which exceeds the limit of " + maxKeyBytes);
+            throw new KeyTooLargeException(bytes.length, maxKeyBytes);
         }
         return bytes;
     }
