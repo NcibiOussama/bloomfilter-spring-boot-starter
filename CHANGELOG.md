@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.4.0]
+
+### Added
+- **Suspend and resume**, for writes that bypass the application (SQL migrations, bulk imports, other
+  services): `BloomFilterRebuilder.suspend(name)` makes every check answer "might contain", on every instance
+  sharing a Redis filter, until `resume(name)` rebuilds the filter from its `BloomFilterLoader`. Scheduled and
+  automatic rebuilds never end a suspension, and `resume` keeps a suspension started in the meantime.
+  Also `POST /actuator/bloomfilters/{name}/suspend` and `.../resume` (with `bloom.rebuild.endpoint-enabled=true`),
+  and a `suspended` field in `/actuator/bloomfilters`.
+- `Suspendable` API in `bloomfilter-core`, implemented by the in-memory and Redis backends.
+- README: "Writes that bypass your application", covering entity listeners, batch jobs, CDC and migrations.
+
 ## [0.3.1]
 
 ### Fixed

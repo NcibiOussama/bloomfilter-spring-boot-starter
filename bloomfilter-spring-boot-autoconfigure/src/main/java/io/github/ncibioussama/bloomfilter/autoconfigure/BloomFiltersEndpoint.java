@@ -2,6 +2,7 @@ package io.github.ncibioussama.bloomfilter.autoconfigure;
 
 import io.github.ncibioussama.bloomfilter.core.BloomFilterSpec;
 import io.github.ncibioussama.bloomfilter.core.BloomFilterStats;
+import io.github.ncibioussama.bloomfilter.core.Suspendable;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import org.springframework.boot.actuate.endpoint.annotation.Endpoint;
@@ -13,8 +14,13 @@ import org.springframework.boot.actuate.endpoint.annotation.WriteOperation;
  * Actuator endpoint {@code /actuator/bloomfilters}. Exposes sizing, statistics and rebuild status, never keys.
  * Enable with {@code management.endpoints.web.exposure.include=bloomfilters}.
  * <p>
- * {@code POST /actuator/bloomfilters/{name}} starts a rebuild, but only when
- * {@code bloom.rebuild.endpoint-enabled=true}.
+ * Write operations, available only when {@code bloom.rebuild.endpoint-enabled=true}:
+ * <ul>
+ *     <li>{@code POST /actuator/bloomfilters/{name}} starts a rebuild</li>
+ *     <li>{@code POST /actuator/bloomfilters/{name}/suspend} suspends the filter before a migration; the filter
+ *     is suspended when the call returns</li>
+ *     <li>{@code POST /actuator/bloomfilters/{name}/resume} rebuilds the filter and ends the suspension</li>
+ * </ul>
  */
 @Endpoint(id = "bloomfilters")
 public class BloomFiltersEndpoint {
@@ -87,11 +93,46 @@ public class BloomFiltersEndpoint {
         return Map.of("filter", name, "status", "started");
     }
 
+    /**
+     * Suspends ({@code action=suspend}) or resumes ({@code action=resume}) a filter.
+     *
+     * @param name   filter name
+     * @param action {@code suspend} or {@code resume}
+     * @return the request status, or {@code null} (HTTP 404) if the filter or action is unknown
+     */
+    @WriteOperation
+    public Map<String, Object> action(@Selector String name, @Selector String action) {
+        if (!registry.names().contains(name) || !("suspend".equals(action) || "resume".equals(action))) {
+            return null;
+        }
+        if (rebuilder == null || properties == null || !properties.getRebuild().isEndpointEnabled()) {
+            return Map.of("filter", name, "status", "disabled",
+                    "hint", "set bloom.rebuild.endpoint-enabled=true and secure the actuator endpoints");
+        }
+        if (!(registry.managed(name).delegate() instanceof Suspendable)) {
+            return Map.of("filter", name, "status", "not-supported");
+        }
+        if ("suspend".equals(action)) {
+            rebuilder.suspend(name); // synchronous: the filter is suspended when the response is sent
+            return Map.of("filter", name, "status", "suspended");
+        }
+        rebuilder.resumeAsync(name);
+        return Map.of("filter", name, "status", "resuming",
+                "hint", "the filter stays suspended until the rebuild completes; check 'suspended'");
+    }
+
     private Map<String, Object> describe(ManagedBloomFilter filter) {
         BloomFilterSpec spec = filter.spec();
         Map<String, Object> d = new LinkedHashMap<>();
         d.put("backend", filter.backend());
         d.put("state", filter.state().name());
+        if (filter.delegate() instanceof Suspendable suspendable) {
+            try {
+                d.put("suspended", suspendable.suspension() != null);
+            } catch (RuntimeException e) {
+                d.put("suspended", "unknown");
+            }
+        }
         d.put("expectedInsertions", spec.expectedInsertions());
         d.put("targetFalsePositiveRate", spec.falsePositiveRate());
         d.put("bitSize", spec.bitSize());

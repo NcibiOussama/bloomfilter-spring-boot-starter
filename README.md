@@ -20,14 +20,14 @@ Secure, observable, declarative Bloom filters for Spring Boot 3.5 and 4.
 <dependency>
   <groupId>io.github.ncibioussama</groupId>
   <artifactId>bloomfilter-spring-boot-starter</artifactId>
-  <version>0.3.1</version>
+  <version>0.4.0</version>
 </dependency>
 ```
 
 Gradle:
 
 ```groovy
-implementation 'io.github.ncibioussama:bloomfilter-spring-boot-starter:0.3.1'
+implementation 'io.github.ncibioussama:bloomfilter-spring-boot-starter:0.4.0'
 ```
 
 Requires Java 17+. Works with **Spring Boot 3.5 and 4.x** from the same artifact (both tested in CI).
@@ -141,6 +141,71 @@ bloom:
 
 An in-memory rebuild temporarily needs twice the filter's memory.
 
+## Writes that bypass your application
+
+The filter only knows the keys it is told about. A row inserted any other way (a SQL migration, a batch import,
+another service writing to the same table) is answered "definitely absent" until the next rebuild. One rule
+covers every case: **add the key before the row becomes visible**. Adding it early is safe (at worst a false
+positive if the transaction rolls back); adding it late opens a window of wrong "not found" answers.
+
+| Who writes | What to do |
+|---|---|
+| Your application, but not through the `@BloomAdd` method | A JPA entity listener covers every insert through JPA (example below) |
+| A batch job or another service | Use the Redis backend and have the writer call `putAll(keys)` on the same filter **before** inserting |
+| CDC / outbox (Debezium, ...) | Works, but between the commit and the event the row is answered "absent". Only if a short delay is acceptable |
+| A SQL migration or bulk import | **Suspend** the filter before, **resume** it after (below) |
+| Something you can't control or schedule | Don't put a Bloom filter in front of that table |
+
+`rebuild-cron` is a safety net (it also drops deleted keys), not a substitute: between two runs, rows written
+behind the filter's back are still answered "absent".
+
+With the in-memory backend, each application instance only sees its own writes. If you run several instances,
+use the Redis backend.
+
+**Entity listener**
+
+```java
+@Component
+public class UserBloomListener {
+    private static BloomFilterRegistry registry;
+
+    @Autowired
+    void init(BloomFilterRegistry registry) { UserBloomListener.registry = registry; }
+
+    @PostPersist
+    void added(User user) { registry.get("users").put(user.getId()); }
+}
+
+@Entity
+@EntityListeners(UserBloomListener.class)
+public class User { ... }
+```
+
+**Migrations and bulk imports: suspend and resume**
+
+```java
+rebuilder.suspend("users");   // every instance now answers "might contain": no wrong "not found"
+runMigration();
+rebuilder.resume("users");    // rebuilds from your BloomFilterLoader, then trusts the filter again
+```
+
+Or from a deployment script, with `bloom.rebuild.endpoint-enabled=true`:
+
+```bash
+curl -X POST localhost:8080/actuator/bloomfilters/users/suspend    # returns once suspended
+./run-migration.sh
+curl -X POST localhost:8080/actuator/bloomfilters/users/resume     # rebuild in the background
+curl localhost:8080/actuator/bloomfilters/users                    # "suspended": false when done
+```
+
+- With Redis the suspension is stored in Redis, so it applies to **every instance** as soon as the call returns.
+  If Redis can't record it, `suspend` throws: the filter is never silently left unprotected.
+- While suspended, checks go to your database and writes still reach the filter.
+- Scheduled and automatic rebuilds never end a suspension, so one can't finish halfway through the migration.
+  Only `resume` does, and only if nobody suspended the filter again in the meantime.
+- If the rebuild in `resume` fails, the filter stays suspended (safe); call `resume` again.
+- With the in-memory backend, the suspension applies to the instance that receives it only.
+
 ## Security
 
 | Threat | Protection |
@@ -149,7 +214,8 @@ An in-memory rebuild temporarily needs twice the filter's memory.
 | Wrong "not found" when Redis is down or a write was lost | Fail-open, then bypass mode (`DEGRADED`) until an automatic rebuild succeeds |
 | Wrong "not found" during startup | Checks are bypassed until the loader finishes; shared filters are only skipped once fully loaded |
 | Wrong "not found" during a rebuild | Old content serves until an atomic swap; concurrent writes go to both filters |
-| Rebuild endpoint abused to load the database | `POST` rebuild is disabled unless `bloom.rebuild.endpoint-enabled=true`; one rebuild per filter at a time |
+| Rebuild endpoint abused to load the database | `POST` rebuild, suspend and resume are disabled unless `bloom.rebuild.endpoint-enabled=true`; one rebuild per filter at a time |
+| Wrong "not found" for rows written outside the application | Suspend the filter around migrations and imports; see [Writes that bypass your application](#writes-that-bypass-your-application) |
 | Misconfiguration exhausting memory | `bloom.max-bits-per-filter` (default 512 MiB) |
 | Oversized keys (CPU, or switching the filter off) | Keys above `bloom.max-key-bytes` (default 4096) are never stored and always answer "might contain", so they reach your database: no error, no degraded filter, no failed rebuild |
 | Injection through key expressions | SpEL expressions come from annotations only; argument values are always data, never evaluated |
@@ -168,7 +234,8 @@ See [SECURITY.md](SECURITY.md) to report a vulnerability.
 | `bloom.filter.fill.ratio`, `bloom.filter.estimated.false.positive.rate`, `bloom.filter.approximate.elements`, `bloom.filter.ready` | `filter`, `backend` |
 
 `management.endpoints.web.exposure.include=bloomfilters` exposes `/actuator/bloomfilters` and
-`/actuator/bloomfilters/{name}` (sizing, fill, counters and rebuild status, never keys).
+`/actuator/bloomfilters/{name}` (sizing, fill, counters, rebuild status and whether the filter is suspended,
+never keys).
 
 ## All properties
 
@@ -184,7 +251,7 @@ See [SECURITY.md](SECURITY.md) to report a vulnerability.
 | `bloom.rebuild.enabled` | `true` | Run scheduled rebuilds and automatic recovery |
 | `bloom.rebuild.recovery-interval` | `1m` | Retry interval for `DEGRADED` filters (`0` disables) |
 | `bloom.rebuild.timeout` | `1h` | Maximum rebuild duration (Redis lock lifetime) |
-| `bloom.rebuild.endpoint-enabled` | `false` | Allow `POST /actuator/bloomfilters/{name}` to rebuild |
+| `bloom.rebuild.endpoint-enabled` | `false` | Allow `POST /actuator/bloomfilters/{name}` (rebuild), `.../{name}/suspend` and `.../{name}/resume` |
 | `bloom.security.hash-algorithm` | `auto` | `auto`, `siphash` or `murmur3` |
 | `bloom.security.secret` | none | SipHash key, ≥16 bytes |
 | `bloom.redis.key-prefix` | `bloom:` | Redis key prefix |
@@ -217,7 +284,7 @@ These come from how Bloom filters and Spring proxies work, not from this library
 
 [`examples/demo`](examples/demo) is a complete Spring Boot 4 user API built on the published starter, with
 end-to-end tests for warm-up, `@BloomCheck`/`@BloomAdd`, rebuilds, the actuator endpoint, two instances
-sharing Redis, and a Redis outage with automatic recovery.
+sharing Redis, a Redis outage with automatic recovery, a SQL migration with suspend/resume, and security.
 
 ## Build
 

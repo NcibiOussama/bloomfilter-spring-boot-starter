@@ -136,6 +136,101 @@ class BloomFilterRebuildTest {
         });
     }
 
+    @Test
+    void suspendBypassesChecksUntilResumeRebuildsFromTheSourceOfTruth() {
+        withLoader.run(context -> {
+            warmUp(context.getBean(BloomFilterWarmUpRunner.class));
+            BloomFilterRebuilder rebuilder = context.getBean(BloomFilterRebuilder.class);
+            ManagedBloomFilter users = context.getBean(BloomFilterRegistry.class).managed("users");
+            UsersTable table = context.getBean(UsersTable.class);
+
+            rebuilder.suspend("users");
+            assertThat(rebuilder.isSuspended("users")).isTrue();
+            table.ids.add(42L);                                    // "SQL migration": the filter is not told
+            assertThat(users.mightContain(42L)).as("no wrong 'absent' during the migration").isTrue();
+
+            // Neither scheduled nor automatic rebuilds end a suspension.
+            assertThat(rebuilder.rebuild("users").outcome()).isEqualTo(Outcome.COMPLETED);
+            users.markDegraded("test");
+            rebuilder.recoverDegradedFilters();
+            assertThat(rebuilder.isSuspended("users")).isTrue();
+            assertThat(users.mightContain(999L)).isTrue();
+
+            BloomFilterRebuilder.Result resumed = rebuilder.resume("users");
+            assertThat(resumed.outcome()).isEqualTo(Outcome.COMPLETED);
+            assertThat(rebuilder.isSuspended("users")).isFalse();
+            assertThat(users.state()).isEqualTo(ManagedBloomFilter.State.READY);
+            assertThat(users.mightContain(42L)).as("migrated row loaded by the rebuild").isTrue();
+            assertThat(users.mightContain(999L)).isFalse();
+        });
+    }
+
+    @Test
+    void suspensionStartedDuringResumeIsKept() {
+        withLoader.run(context -> {
+            warmUp(context.getBean(BloomFilterWarmUpRunner.class));
+            BloomFilterRebuilder rebuilder = context.getBean(BloomFilterRebuilder.class);
+            UsersTable table = context.getBean(UsersTable.class);
+            rebuilder.suspend("users");
+            table.onLoad = () -> rebuilder.suspend("users");      // a second migration starts mid-rebuild
+
+            BloomFilterRebuilder.Result resumed = rebuilder.resume("users");
+
+            assertThat(resumed.outcome()).isEqualTo(Outcome.SUSPENDED_AGAIN);
+            assertThat(rebuilder.isSuspended("users")).isTrue();
+            assertThat(context.getBean(BloomFilterRegistry.class).get("users").mightContain(999L)).isTrue();
+        });
+    }
+
+    @Test
+    void failedResumeKeepsTheSuspension() {
+        withLoader.run(context -> {
+            warmUp(context.getBean(BloomFilterWarmUpRunner.class));
+            BloomFilterRebuilder rebuilder = context.getBean(BloomFilterRebuilder.class);
+            rebuilder.suspend("users");
+            context.getBean(UsersTable.class).failing = true;
+
+            BloomFilterRebuilder.Result resumed = rebuilder.resume("users");
+
+            assertThat(resumed.outcome()).isEqualTo(Outcome.FAILED);
+            assertThat(resumed.message()).contains("stays suspended");
+            assertThat(rebuilder.isSuspended("users")).isTrue();
+        });
+        runner.run(context -> {
+            BloomFilterRebuilder rebuilder = context.getBean(BloomFilterRebuilder.class);
+            rebuilder.suspend("users");
+            assertThat(rebuilder.resume("users").outcome()).isEqualTo(Outcome.NO_LOADER);
+            assertThat(rebuilder.isSuspended("users")).as("no loader: stays safely suspended").isTrue();
+        });
+    }
+
+    @Test
+    void endpointSuspendAndResume() {
+        withLoader.run(context -> {
+            BloomFiltersEndpoint endpoint = endpoint(context.getBean(BloomFilterRegistry.class),
+                    context.getBean(BloomFilterRebuilder.class), context.getBean(BloomFilterProperties.class));
+            assertThat(endpoint.action("users", "suspend")).containsEntry("status", "disabled");
+            assertThat(context.getBean(BloomFilterRebuilder.class).isSuspended("users")).isFalse();
+        });
+        withLoader.withPropertyValues("bloom.rebuild.endpoint-enabled=true").run(context -> {
+            warmUp(context.getBean(BloomFilterWarmUpRunner.class));
+            BloomFilterRebuilder rebuilder = context.getBean(BloomFilterRebuilder.class);
+            BloomFiltersEndpoint endpoint = endpoint(context.getBean(BloomFilterRegistry.class), rebuilder,
+                    context.getBean(BloomFilterProperties.class));
+
+            assertThat(endpoint.action("users", "suspend")).containsEntry("status", "suspended");
+            assertThat(rebuilder.isSuspended("users")).as("suspended when the call returns").isTrue();
+            assertThat(endpoint.filter("users")).containsEntry("suspended", true);
+
+            assertThat(endpoint.action("users", "resume")).containsEntry("status", "resuming");
+            awaitTrue(() -> !rebuilder.isSuspended("users"));
+            assertThat(endpoint.filter("users")).containsEntry("suspended", false);
+
+            assertThat(endpoint.action("users", "drop-table")).isNull();
+            assertThat(endpoint.action("unknown", "suspend")).isNull();
+        });
+    }
+
     private static BloomFiltersEndpoint endpoint(BloomFilterRegistry registry, BloomFilterRebuilder rebuilder,
                                                  BloomFilterProperties properties) {
         return new BloomFiltersEndpoint(registry, rebuilder, properties);
@@ -161,6 +256,7 @@ class BloomFilterRebuildTest {
 
         final Set<Long> ids = ConcurrentHashMap.newKeySet();
         volatile boolean failing;
+        volatile Runnable onLoad;
 
         UsersTable() {
             ids.addAll(Set.of(1L, 2L, 3L));
@@ -177,6 +273,11 @@ class BloomFilterRebuildTest {
                 throw new IllegalStateException("database down");
             }
             filter.putAll(ids);
+            Runnable hook = onLoad;
+            if (hook != null) {
+                onLoad = null;
+                hook.run();
+            }
         }
 
         @Bean
