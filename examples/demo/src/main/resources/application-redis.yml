@@ -1,0 +1,21 @@
+# Shared filters for several instances: run with --spring.profiles.active=redis and set the environment
+# variable BLOOM_SECURITY_SECRET (bloom.security.secret): at least 16 characters, identical on every instance.
+# Never commit it.
+spring:
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      timeout: 500ms
+
+management:
+  health:
+    redis:
+      enabled: true
+
+bloom:
+  default-backend: redis
+  redis:
+    key-prefix: "bloom:demo:"
+  rebuild:
+    recovery-interval: 10s
