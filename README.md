@@ -20,14 +20,14 @@ Secure, observable, declarative Bloom filters for Spring Boot 3.5 and 4.
 <dependency>
   <groupId>io.github.ncibioussama</groupId>
   <artifactId>bloomfilter-spring-boot-starter</artifactId>
-  <version>0.3.0</version>
+  <version>0.3.1</version>
 </dependency>
 ```
 
 Gradle:
 
 ```groovy
-implementation 'io.github.ncibioussama:bloomfilter-spring-boot-starter:0.3.0'
+implementation 'io.github.ncibioussama:bloomfilter-spring-boot-starter:0.3.1'
 ```
 
 Requires Java 17+. Works with **Spring Boot 3.5 and 4.x** from the same artifact (both tested in CI).
@@ -85,7 +85,7 @@ class UserIdLoader implements BloomFilterLoader {
     @Transactional(readOnly = true)
     public void load(BloomFilter filter) {
         try (Stream<Long> ids = users.streamAllIds()) {
-            filter.putAll(ids::iterator);
+            filter.putAll((Iterable<Long>) ids::iterator);
         }
     }
 }
@@ -150,7 +150,9 @@ An in-memory rebuild temporarily needs twice the filter's memory.
 | Wrong "not found" during startup | Checks are bypassed until the loader finishes; shared filters are only skipped once fully loaded |
 | Wrong "not found" during a rebuild | Old content serves until an atomic swap; concurrent writes go to both filters |
 | Rebuild endpoint abused to load the database | `POST` rebuild is disabled unless `bloom.rebuild.endpoint-enabled=true`; one rebuild per filter at a time |
-| Misconfiguration exhausting memory | `bloom.max-bits-per-filter` (default 512 MiB) and `bloom.max-key-bytes` (default 4096) |
+| Misconfiguration exhausting memory | `bloom.max-bits-per-filter` (default 512 MiB) |
+| Oversized keys (CPU, or switching the filter off) | Keys above `bloom.max-key-bytes` (default 4096) are never stored and always answer "might contain", so they reach your database: no error, no degraded filter, no failed rebuild |
+| Injection through key expressions | SpEL expressions come from annotations only; argument values are always data, never evaluated |
 | Keys leaking (emails, tokens) | Keys never appear in logs, exceptions, metrics or the endpoint |
 | Changing size or secret on a shared filter | The Redis key embeds a configuration fingerprint, so a new empty filter is used and reloaded |
 
@@ -189,15 +191,33 @@ See [SECURITY.md](SECURITY.md) to report a vulnerability.
 | `bloom.redis.batch-size` | `500` | Keys per Redis call in bulk inserts |
 | `bloom.warm-up.enabled` | `true` | Run `BloomFilterLoader` beans |
 | `bloom.warm-up.mode` | `if-empty` | `if-empty` or `always` |
-| `bloom.max-key-bytes` | `4096` | Reject larger keys |
+| `bloom.max-key-bytes` | `4096` | Larger keys are not stored and always answer "might contain" |
 | `bloom.max-bits-per-filter` | `4294967296` | Reject larger filters |
 
-## Limitations
+## Good to know
 
-- Single keys can't be removed (standard Bloom filter); use a scheduled rebuild to drop deleted keys.
-- Rebuilding requires a `BloomFilterLoader` for the filter. Without one, a `DEGRADED` filter stays in bypass
-  mode until restart.
-- Annotations work on calls through the Spring proxy, not on self-invocation (same as `@Transactional`).
+These come from how Bloom filters and Spring proxies work, not from this library. Here's how to handle each:
+
+- **Removing keys.** A Bloom filter can't remove a single key: its bits are shared with other keys, and clearing
+  them would make those keys look absent. Deleted keys only cost a few extra false positives (a database lookup,
+  never a wrong answer). To drop them, set `rebuild-cron`, for example nightly.
+- **Rebuilding needs a loader.** To rebuild, the library reloads every key through your `BloomFilterLoader`.
+  Without a loader, a `DEGRADED` filter can't repair itself, but it stays safe: it answers "maybe" (so your
+  database is used) until the application restarts.
+- **Self-invocation.** Like `@Transactional` and `@Cacheable`, `@BloomCheck` and `@BloomAdd` only apply when the
+  method is called from another bean, through the Spring proxy. Inside the same class, check the filter directly:
+
+  ```java
+  if (!registry.get("users").mightContain(id)) {
+      return Optional.empty();
+  }
+  ```
+
+## Example application
+
+[`examples/demo`](examples/demo) is a complete Spring Boot 4 user API built on the published starter, with
+end-to-end tests for warm-up, `@BloomCheck`/`@BloomAdd`, rebuilds, the actuator endpoint, two instances
+sharing Redis, and a Redis outage with automatic recovery.
 
 ## Build
 

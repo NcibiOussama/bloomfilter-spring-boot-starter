@@ -1,0 +1,31 @@
+spring:
+  application:
+    name: bloomfilter-demo
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: create-drop
+    # Run data.sql after Hibernate created the schema, before the filters are warmed up.
+    defer-datasource-initialization: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,bloomfilters
+  health:
+    redis:
+      enabled: false   # the default profile does not use Redis
+
+bloom:
+  rebuild:
+    # Demo only: allows POST /actuator/bloomfilters/{name}. Secure the actuator before enabling this for real.
+    endpoint-enabled: true
+  filters:
+    users:
+      expected-insertions: 100000
+      false-positive-rate: 0.01
+      rebuild-cron: "0 0 3 * * *"   # nightly rebuild drops deleted ids
+    emails:
+      expected-insertions: 100000
+      false-positive-rate: 0.001

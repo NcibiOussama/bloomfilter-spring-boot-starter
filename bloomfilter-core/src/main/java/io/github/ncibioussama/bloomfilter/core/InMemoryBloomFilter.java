@@ -62,8 +62,12 @@ public final class InMemoryBloomFilter implements BloomFilter, Rebuildable {
 
     @Override
     public boolean mightContain(Object key) {
+        long[] indexes = indexes(key);
+        if (indexes == null) {
+            return true; // oversized keys are never stored: "might contain" sends the caller to the source of truth
+        }
         Bits bits = current;
-        for (long index : indexes(key)) {
+        for (long index : indexes) {
             if (!bits.get(index)) {
                 return false;
             }
@@ -74,6 +78,9 @@ public final class InMemoryBloomFilter implements BloomFilter, Rebuildable {
     @Override
     public boolean put(Object key) {
         long[] indexes = indexes(key);
+        if (indexes == null) {
+            return false; // oversized keys are not stored; checks for them always answer "might contain"
+        }
         Bits target = next;      // read next before current, see field comment
         Bits bits = current;
         boolean changed = false;
@@ -136,8 +143,15 @@ public final class InMemoryBloomFilter implements BloomFilter, Rebuildable {
         }
     }
 
+    /** @return the bit indexes of the key, or {@code null} if the key exceeds the encoder's size limit */
     private long[] indexes(Object key) {
-        return hashStrategy.indexes(keyEncoder.encode(key), spec.hashFunctions(), spec.bitSize());
+        byte[] encoded;
+        try {
+            encoded = keyEncoder.encode(key);
+        } catch (KeyTooLargeException e) {
+            return null;
+        }
+        return hashStrategy.indexes(encoded, spec.hashFunctions(), spec.bitSize());
     }
 
     @Override

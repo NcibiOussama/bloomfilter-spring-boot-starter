@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here. The project follows [Semantic Versioning](https://semver.org).
 
+## [0.3.1]
+
+### Fixed
+- **Oversized keys could switch a filter off or block startup.** A key above `bloom.max-key-bytes` made `put`
+  fail and marked the filter `DEGRADED`; the automatic rebuild then failed on the same row, so the filter stayed
+  bypassed, and warm-up failed at the next restart. A `@BloomCheck` with such a key returned HTTP 500. Oversized
+  keys are now never stored and always answer "might contain" (the caller asks its source of truth), on every
+  path: `put`, `putAll`, warm-up, rebuilds, both backends.
+- Invalid keys (`null`, unsupported types) still throw, but no longer mark the filter `DEGRADED`.
+- The `BloomFilterLoader` example (`filter.putAll(ids::iterator)`) did not compile; it now casts to `Iterable<Long>`.
+
+### Added
+- `KeyTooLargeException` (an `IllegalArgumentException`) in `bloomfilter-core`, thrown by `DefaultKeyEncoder`.
+- `examples/demo`: a Spring Boot 4 application with end-to-end, security and Redis integration tests, run in CI
+  against every commit.
+
 ## [0.3.0]
 
 ### Added

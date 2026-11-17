@@ -44,7 +44,7 @@ class DefaultKeyEncoderTest {
     void rejectsOversizedKeysWithoutLeakingThem() {
         String secretLooking = "x".repeat(65);
         assertThatThrownBy(() -> encoder.encode(secretLooking))
-                .isInstanceOf(IllegalArgumentException.class)
+                .isInstanceOf(KeyTooLargeException.class)
                 .hasMessageContaining("exceeds the limit of 64")
                 .hasMessageNotContaining(secretLooking);
     }

@@ -10,6 +10,9 @@ import io.github.ncibioussama.bloomfilter.core.FailureMode;
 import io.github.ncibioussama.bloomfilter.core.RebuildSession;
 import io.github.ncibioussama.bloomfilter.core.SipHashStrategy;
 import java.time.Duration;
+import org.springframework.data.redis.core.RedisCallback;
+import java.nio.charset.StandardCharsets;
+import java.util.Set;
 import java.util.List;
 import java.util.stream.LongStream;
 import org.junit.jupiter.api.AfterAll;
@@ -73,6 +76,48 @@ class RedisBloomFilterTest {
         assertThat(filter.put("alice")).isFalse();
         assertThat(filter.mightContain("alice")).isTrue();
         assertThat(filter.isEmpty()).isFalse();
+    }
+
+    @Test
+    void oversizedKeysAreNeverStoredAndAlwaysMightContain() {
+        RedisBloomFilter filter = new RedisBloomFilter(BloomFilterSpec.of("big", 10_000, 0.01), hash,
+                new DefaultKeyEncoder(64), template, "bloom:test:", FailureMode.THROW, 2);
+        String oversized = "x".repeat(65);
+
+        assertThat(filter.put(oversized)).isFalse();
+        assertThat(filter.isEmpty()).isTrue();
+        assertThat(filter.mightContain(oversized)).isTrue();
+        assertThat(filter.putAll(List.of("a", oversized, "b", "c"))).isEqualTo(3);   // batch size 2
+        assertThat(filter.mightContain("a")).isTrue();
+        assertThat(filter.mightContain("c")).isTrue();
+        assertThat(filter.backendErrors()).isZero();
+
+        RebuildSession session = filter.beginRebuild(Duration.ofMinutes(1));
+        session.target().putAll(List.of("d", oversized));
+        assertThat(session.target().put(oversized)).isFalse();
+        assertThat(session.target().mightContain(oversized)).isTrue();
+        assertThat(session.commit()).isTrue();
+        assertThat(filter.mightContain("d")).isTrue();
+        assertThat(filter.mightContain(oversized)).isTrue();
+    }
+
+    @Test
+    void redisNeverStoresKeysInPlainText() {
+        RedisBloomFilter filter = filter("emails", FailureMode.THROW);
+        filter.putAll(List.of("alice@example.com", "bob@example.com"));
+        RebuildSession session = filter.beginRebuild(Duration.ofMinutes(1));
+        session.target().put("carol@example.com");
+
+        Set<String> keys = template.keys("*");
+        assertThat(keys).isNotEmpty().allSatisfy(key -> assertThat(key).doesNotContain("example.com"));
+        for (String key : keys) {
+            byte[] raw = key.getBytes(StandardCharsets.UTF_8);
+            byte[] value = template.execute((RedisCallback<byte[]>) c ->
+                    "string".equals(c.keyCommands().type(raw).code()) ? c.stringCommands().get(raw) : null);
+            String text = value == null ? "" : new String(value, StandardCharsets.ISO_8859_1);
+            assertThat(text).doesNotContain("alice").doesNotContain("bob").doesNotContain("carol");
+        }
+        session.abort();
     }
 
     @Test

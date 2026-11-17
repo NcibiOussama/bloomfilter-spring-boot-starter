@@ -75,6 +75,8 @@ public final class ManagedBloomFilter implements BloomFilter {
             boolean changed = delegate.put(key);
             detectLostWrite(errorsBefore);
             return changed;
+        } catch (IllegalArgumentException e) {
+            throw e; // invalid key (null, unsupported type): nothing was lost, a check of it would fail the same way
         } catch (RuntimeException e) {
             markDegraded();
             throw e;
@@ -88,6 +90,8 @@ public final class ManagedBloomFilter implements BloomFilter {
             long added = delegate.putAll(counting(keys));
             detectLostWrite(errorsBefore);
             return added;
+        } catch (IllegalArgumentException e) {
+            throw e; // invalid key: a caller error, not a lost write
         } catch (RuntimeException e) {
             markDegraded();
             throw e;

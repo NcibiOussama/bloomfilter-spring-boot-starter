@@ -15,7 +15,7 @@ import io.github.ncibioussama.bloomfilter.core.BloomFilter;
  *     &#64;Transactional(readOnly = true)
  *     public void load(BloomFilter filter) {
  *         try (Stream&lt;String&gt; emails = users.streamAllEmails()) {
- *             filter.putAll(emails::iterator);
+ *             filter.putAll((Iterable&lt;String&gt;) emails::iterator);
  *         }
  *     }
  * }
